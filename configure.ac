@@ -95,6 +95,12 @@ m4_include([m4/sharp.m4])
 CHECK_SHARP
 AC_MSG_RESULT([SHARP support: $sharp_happy])
 
+# check for urom
+AM_CONDITIONAL([HAVE_UROM], [false])
+m4_include([m4/urom.m4])
+CHECK_UROM
+AC_MSG_RESULT([UROM support: $urom_happy])
+
 #check for required headers
 AC_CHECK_HEADERS([limits.h stdlib.h string.h unistd.h], [],
                  [AC_MSG_FAILURE([unable to find required headers])])

@@ -20,6 +20,11 @@
 #include "sharp/api/sharp_coll.h"
 #include "utils.h"
 
+#if HAVE_UROM
+#include "urom/api/urom.h"
+#include "ucc/api/ucc.h"
+#endif
+
 extern ncclNet_v8_t ncclNetPlugin_v8;
 extern ncclNet_v7_t ncclNetPlugin_v7;
 extern ncclNet_v6_t ncclNetPlugin_v6;
@@ -68,6 +73,18 @@ struct ncclSharpInfo {
   uint64_t hostId;
   uint64_t jobId;
 };
+
+struct ncclUromInfo {
+  urom_service_h  service;
+  urom_worker_h   worker;
+  urom_domain_h   udom;
+  ucc_context_h   ucc_ctx;
+  ucc_team_h      ucc_team;
+  uint8_t         worker_addr[UROM_WORKER_ADDR_MAX_LEN];
+  uint64_t        worker_id;
+};
+
+struct ncclUromInfo urom_info;
 
 static __inline__ enum sharp_datatype typeConvert(ncclDataType_t type) {
   switch (type) {
@@ -193,6 +210,130 @@ int ncclSharpOobBcast(void *ctx, void *buf, int size, int root) {
   return 0;
 }
 
+/* UROM addition */
+static urom_status_t oob_allgather(void *sbuf, void *rbuf, size_t msglen,
+                                   void *coll_info, void **req)
+{
+  struct ncclSharpCollComm *cComm = (struct ncclSharpCollComm*) coll_info;
+  int *request = calloc(1, sizeof(int));
+  int ret = 0;
+  /* FIXME: convert to SHARP OOB for inow */
+  void *buf = malloc(msglen * cComm->nranks);
+  // memcpy sbuf to buf
+  memcpy((buf + (msglen * cComm->rank)), sbuf, msglen);
+
+  // allgather
+  ret = ncclSharpAllGather(coll_info, buf, msglen);
+  if (ret != 0) {
+    printf("fail on allgather\n");
+    return UROM_ERR_NO_MESSAGE;
+  }
+  // memcpy buf to rbuf
+
+  memcpy(rbuf, buf + msglen, msglen * cComm->nranks);
+  *request = 1;
+  *req = request;
+  return UROM_OK;
+}
+
+static urom_status_t oob_allgather_test(void *req)
+{
+  /* FERROL: allgather is implemented as blocking, just return OK */
+  return UROM_OK;
+}
+
+static urom_status_t oob_allgather_free(void *req)
+{
+  return UROM_OK;
+}
+
+/* END UROM addition */
+
+
+
+int ncclUromInit(void) {
+  urom_service_h service;
+  urom_worker_h worker;
+  urom_worker_params_t worker_params;
+  uint64_t worker_id = UROM_WORKER_ID_ANY;
+  uint8_t worker_addr[UROM_WORKER_ADDR_MAX_LEN];
+  size_t  worker_addr_len = UROM_WORKER_ADDR_MAX_LEN;
+  urom_device_t *dev;
+  struct urom_device *device_list;
+  int num_devices;
+  char *dev_name = NULL;
+  urom_service_params_t service_params = {0};
+  urom_status_t status;
+
+  /* connect to uromd */
+  status = urom_get_device_list(&device_list, &num_devices);
+  if (status != UROM_OK) {
+    printf("barf\n");
+    return -1;
+  }
+
+  dev = device_list;
+  while (dev) {
+    if (dev_name) {
+      if (!strcmp(dev_name, dev->name)) {
+        break;
+      }
+    } else {
+      break;
+    }
+    dev = dev->next;
+  }
+
+  if (!dev) {
+    printf("no device\n");
+    return -2;
+  }
+
+  service_params.flags = UROM_SERVICE_PARAM_DEVICE;
+  service_params.device = dev;
+  status = urom_service_connect(&service_params, &service);
+  if (status != UROM_OK) {
+    fprintf(stderr, "urom_service_connect() returned error: %s\n",
+            urom_status_string(status));
+    status = urom_free_device_list(device_list);
+    assert (status == UROM_OK);
+    return -1;
+  };
+
+  urom_info.service = service;
+
+  printf("Connected!\n");
+  status = urom_free_device_list(device_list);
+
+  /* Spawn worker */
+  status = urom_worker_spawn(service, UROM_WORKER_TYPE_UCC, worker_addr,
+                             &worker_addr_len, &worker_id);
+  if (status != UROM_OK) {
+      printf("urom_worker_spawn() returned error: %s\n",
+             urom_status_string(status));
+      return -1;
+  }   
+
+  printf("Spawned worker ID: %lu\n", worker_id);
+
+  /* Worker connect */
+  worker_params.serviceh        = service;
+  worker_params.addr            = worker_addr;
+  worker_params.addr_len        = worker_addr_len;
+  worker_params.num_cmd_notifyq = 1;
+
+  status = urom_worker_connect(&worker_params, &worker);
+  if (status != UROM_OK) {
+      printf("urom_worker_connect() returned error: %s\n",
+             urom_status_string(status));
+      return -1; 
+  }
+
+  urom_info.worker = worker;
+
+  return 0;
+}
+
 ncclResult_t ncclSharpInit(ncclDebugLogger_t logFunction) {
   struct timeval tval;
   gettimeofday(&tval, NULL);
@@ -203,6 +344,8 @@ ncclResult_t ncclSharpInit(ncclDebugLogger_t logFunction) {
   setenv("SHARP_COLL_NUM_COLL_GROUP_RESOURCE_ALLOC_THRESHOLD", "0", 0);
   setenv("SHARP_COLL_LOCK_ON_COMM_INIT", "1", 0);
   setenv("SHARP_COLL_LOG_LEVEL", "3", 0);
+
+  ncclUromInit();
 
   return ncclNetPlugin_v7.init(logFunction);
 }
@@ -228,6 +371,7 @@ ncclResult_t ncclSharpGetProperties_v5(int dev, ncclNetProperties_v5_t* props) {
   return ncclNetPlugin_v5.getProperties(dev, props);
 }
 
+/* FERROL: nothing needs to be done here */
 ncclResult_t ncclSharpListen(int dev, void* opaqueHandle, void** listenComm) {
   struct ncclSharpListenComm *lComm;
   ncclResult_t status;
@@ -243,6 +387,7 @@ ncclResult_t ncclSharpConnect(void* handles[], int nranks, int rank, void* liste
   struct ncclSharpListenComm* lComm = (struct ncclSharpListenComm*)listenComm;
   struct ncclSharpCollComm* cComm;
   char *useSharp;
+  char *useUROM;
 
   if(nranks < ncclParamSharpGroupSizeThresh()) {
     INFO(NCCL_INIT|NCCL_NET|NCCL_ENV, "SHARP: Group size:%d is less than threshold:%d. fallback to non-sharp",
@@ -357,6 +502,120 @@ ncclResult_t ncclSharpConnect(void* handles[], int nranks, int rank, void* liste
   }
 
   *collComm = cComm;
+
+  useUROM = getenv("NCCL_UROM_ENABLE");
+  if (useUROM != NULL) {
+    urom_status_t status;
+    urom_worker_notify_t *notif;
+    ucc_lib_params_t lib_params = {
+        .mask        = UCC_LIB_PARAM_FIELD_THREAD_MODE,
+        .thread_mode = UCC_THREAD_SINGLE,
+    };
+    urom_worker_cmd_t init_cmd = {
+        .cmd_type                  = UROM_WORKER_CMD_UCC,
+        .ucc.cmd_type              = UROM_WORKER_CMD_UCC_LIB_CREATE,
+        .ucc.lib_create_cmd.params = &lib_params,
+    };
+#if 0
+    urom_worker_cmd_t pass_dc_cmd = {
+        .cmd_type     = UROM_WORKER_CMD_UCC,
+        .ucc.cmd_type = UROM_WORKER_CMD_CREATE_PASSIVE_DATA_CHANNEL,
+        .ucc.pass_dc_create_cmd.ucp_addr = ucp_worker_addr,
+        .ucc.pass_dc_create_cmd.addr_len = ucp_worker_addr_len,
+    };
+#endif
+    urom_worker_cmd_t ctx_cmd = {
+        .cmd_type          = UROM_WORKER_CMD_UCC,
+        .ucc.dpu_worker_id = cComm->rank,
+        .ucc.cmd_type      = UROM_WORKER_CMD_UCC_CONTEXT_CREATE,
+        .ucc.context_create_cmd =
+            {
+              .start   = 0,
+              .stride  = 1,
+              .size    = cComm->nranks,
+              .base_va = NULL,
+              .len     = 0,
+          },
+    };
+    urom_worker_cmd_t team_cmd = {
+      .cmd_type          = UROM_WORKER_CMD_UCC,
+      .ucc.dpu_worker_id = cComm->rank,
+      .ucc.cmd_type      = UROM_WORKER_CMD_UCC_TEAM_CREATE,
+      .ucc.team_create_cmd =
+          {
+              .start  = 0,
+              .stride = 1,
+              .size   = cComm->nranks,
+          },
+    };
+
+    /* create a domain */
+    urom_domain_params_t udom_params = {
+      .flags = UROM_DOMAIN_WORKER_ADDR,
+      .mask = UROM_DOMAIN_PARAM_FIELD_OOB |
+              UROM_DOMAIN_PARAM_FIELD_WORKER |
+              UROM_DOMAIN_PARAM_FIELD_WORKER_ID,
+      .oob =
+          {
+              .allgather     = oob_allgather,
+              .req_test      = oob_allgather_test,
+              .req_free      = oob_allgather_free,
+              .coll_info     = cComm,
+              .n_oob_indexes = cComm->nranks,
+              .oob_index     = cComm->rank,
+          },
+      .domain_worker_id = cComm->rank,
+      .workers          = &urom_info.worker,
+      .num_workers      = 1,
+      .domain_size      = cComm->nranks,
+    };
+    status = urom_domain_create_post(&udom_params, &urom_info.udom);
+    if (status < UROM_OK) {
+        printf("urom error: %s\n", urom_status_string(status));
+        return status;
+    }
+    while (UROM_INPROGRESS == (status = urom_domain_create_test(urom_info.udom)))
+      ;
+
+    if (status < UROM_OK) {
+      printf("urom error: %s\n", urom_status_string(status));
+      return status;
+    }
+    /* create a context */
+    urom_worker_push_cmdq(urom_info.worker, 0, &init_cmd);
+    while (UROM_ERR_QUEUE_EMPTY ==
+           (status = urom_worker_pop_notifyq(urom_info.worker, 0, &notif))) {
+        sched_yield();
+    }
+    printf("debug: lib create notif->status: %d\n", notif->ucc.status);
+#if 0
+        urom_worker_push_cmdq(worker, 0, &pass_dc_cmd);
+        while (UROM_ERR_QUEUE_EMPTY ==
+               (status = urom_worker_pop_notifyq(worker, 0, &notif))) {
+            sched_yield();
+        }
+        printf("debug: pass dc create notif->status: %d\n", notif->ucc.status);
+#endif
+    urom_worker_push_cmdq(urom_info.worker, 0, &ctx_cmd);
+    while (UROM_ERR_QUEUE_EMPTY ==
+           (status = urom_worker_pop_notifyq(urom_info.worker, 0, &notif))) {
+        sched_yield();
+    }
+    printf("debug: ctx create notif->status: %d, ucc_context: %p\n",
+           notif->ucc.status, notif->ucc.context_create_nqe.context);
+    team_cmd.ucc.team_create_cmd.context_h = (void *)notif->ucc.context_create_nqe.context;
+    urom_info.ucc_ctx = notif->ucc.context_create_nqe.context;
+    /* create a team */
+    urom_worker_push_cmdq(urom_info.worker, 0, &team_cmd);
+    while (UROM_ERR_QUEUE_EMPTY ==
+           (status = urom_worker_pop_notifyq(urom_info.worker, 0, &notif))) {
+        sched_yield();
+    }
+    printf("debug: team create notif->status: %d, team_h: %p\n",
+           notif->ucc.status, notif->ucc.team_create_nqe.team);
+    urom_info.ucc_team = notif->ucc.team_create_nqe.team;
+  }
+
   return ncclSuccess;
 }
 
