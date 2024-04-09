@@ -785,6 +785,7 @@ ncclResult_t ncclSharpRegMrDmaBuf(void* collComm, void* data, size_t size, int t
   *mhandle = mh;
   return ncclSuccess;
 #else
+    printf("ERROR!\n");
   return ncclInternalError;
 #endif
 }
@@ -799,8 +800,9 @@ typedef struct reg_keys {
 typedef struct urom_mapped_mem {
     ucp_mem_h memh;
     void *src;
+    size_t len;
     size_t key_len;
-    char key[512];
+    void *key;
 } urom_mapped_mem_t;
 
 size_t map_beg = 0;
@@ -838,6 +840,9 @@ ncclResult_t ncclSharpRegMr(void* collComm, void* data, size_t size, int type, v
     ucs_status = ucp_rkey_pack(ucp_ctx, map->memh, &map->key, &map->key_len);
     assert (ucs_status == UCS_OK);
 
+    map->src = data;
+    map->len = size;
+
     map_end = (map_end + 1) % 128;
     *mhandle = map;
 #endif
@@ -847,7 +852,6 @@ ncclResult_t ncclSharpRegMr(void* collComm, void* data, size_t size, int type, v
 
 
 ncclResult_t ncclSharpRegMr_v7(void* collComm, void* data, int size, int type, void** mhandle) {
-    printf("noop\n");
     return ncclSuccess;
 //  return ncclSharpRegMr(collComm, data, (size_t)size, type, mhandle);
 }
@@ -952,7 +956,6 @@ ncclResult_t ncclSharpIallreduce(void* collComm, void* sendData, void* recvData,
   req->requestType = NCCL_SHARP_REQ_SHARP_COLL;
   *request = req;
 #endif
-//    printf("COLLECTIVE start!!\n");
     int rank;
     urom_request_t *req = malloc(sizeof(urom_request_t));
     urom_worker_notify_t *notif;
@@ -963,38 +966,38 @@ ncclResult_t ncclSharpIallreduce(void* collComm, void* sendData, void* recvData,
     keys->xgvmi_flag = 0;
     //FIXME: this would eventually be map_beg, not 0
     for (int i = 0; i < map_end; i++) {
-        if (map_array[i].src == sendData) {
+        if (map_array[i].src <= sendData &&
+            (map_array[i].src + map_array[i].len) >= sendData) {
             keys->src_len = map_array[i].key_len;
             memcpy(keys->rkeys, map_array[i].key, keys->src_len);
-            printf("found src\n");
             break;
         }
     }
+#if 1
     // error check?
     for (int i = 0; i < map_end; i++) {
-        if (map_array[i].src == recvData) {
+        if (map_array[i].src <= recvData &&
+            (map_array[i].src + map_array[i].len) >= recvData) {
             keys->dst_len = map_array[i].key_len;
             memcpy(keys->rkeys + keys->src_len, map_array[i].key, keys->dst_len);
-            printf("found dst\n");
             break;
         }
     }
-
+#endif
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     size_t size = count * dt_size;
-//    printf("count: %lu, dt_size %d\n", count, dt_size);
-//    memcpy(shared_buffer, sendData, size);
     ucc_coll_args_t coll_args_allreduce = {
-        .mask = UCC_COLL_ARGS_FIELD_GLOBAL_WORK_BUFFER,
+        .mask = UCC_COLL_ARGS_FIELD_GLOBAL_WORK_BUFFER | UCC_COLL_ARGS_FIELD_FLAGS,
+        .flags = UCC_COLL_ARGS_FLAG_MEM_MAPPED_BUFFERS,
         .coll_type = UCC_COLL_TYPE_ALLREDUCE,
         .src.info = {
-            .buffer = (void *)shared_buffer,
+            .buffer = (void *)sendData,
             .count = size,
             .datatype = UCC_DT_FLOAT32, //change this
             .mem_type = UCC_MEMORY_TYPE_UNKNOWN,
         },
         .dst.info = {
-            .buffer = (void *)(shared_buffer + (128 * 1024 * 1024)),
+            .buffer = (void *)(recvData),
             .count = size,
             .datatype = UCC_DT_FLOAT32,
             .mem_type = UCC_MEMORY_TYPE_UNKNOWN,
@@ -1008,23 +1011,17 @@ ncclResult_t ncclSharpIallreduce(void* collComm, void* sendData, void* recvData,
         .ucc.coll_cmd.coll_args = &coll_args_allreduce,
         .ucc.coll_cmd.team = urom_info.ucc_team,
         .ucc.coll_cmd.use_xgvmi = 0,
+        .ucc.coll_cmd.work_buffer = coll_args_allreduce.global_work_buffer,
+        .ucc.coll_cmd.work_buffer_size = sizeof(reg_keys_t) + keys->src_len + keys->dst_len,
     };
 
-//    printf("COLLECTIVE!!\n");
     urom_worker_push_cmdq(urom_info.worker, 0, &coll_cmd);
-    //while (UROM_ERR_QUEUE_EMPTY == (status = urom_worker_pop_notifyq(urom_info.worker, 0, &notif)));
-/*    if (UROM_ERR_QUEUE_EMPTY == status) {
-        *done = 0;
-        return ncclSuccess;
-    }*/
-    //memcpy(recvData, shared_buffer + (128 * 1024 * 1024), size);
 
     req->dst = recvData;
     req->len = size;
     req->id = num_outstanding;
     req->keys = keys;
     *request = req;
-//    printf("I'm here\n");
   return ncclSuccess;
 }
 
