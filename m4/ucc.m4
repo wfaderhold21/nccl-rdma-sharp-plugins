@@ -35,7 +35,7 @@ AS_IF([test "x$ucc_checked" != "xyes"],[
 
         AC_CHECK_HEADERS([ucc/api/ucc.h],
         [
-            AC_CHECK_LIB([ucc], [ucc_init],
+            AC_CHECK_LIB([ucc], [ucc_init_version],
             [
                 ucc_happy="yes"
             ],
