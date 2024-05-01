@@ -101,6 +101,11 @@ m4_include([m4/urom.m4])
 CHECK_UROM
 AC_MSG_RESULT([UROM support: $urom_happy])
 
+AM_CONDITIONAL([HAVE_UCC], [false])
+m4_include([m4/ucc.m4])
+CHECK_UCC
+AC_MSG_RESULT([UCC support: $ucc_happy])
+
 #check for required headers
 AC_CHECK_HEADERS([limits.h stdlib.h string.h unistd.h], [],
                  [AC_MSG_FAILURE([unable to find required headers])])
