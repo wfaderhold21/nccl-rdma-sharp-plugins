@@ -39,3 +39,9 @@ libnccl_net_la_CPPFLAGS += -DHAVE_UROM $(UROM_CPPFLAGS)
 libnccl_net_la_LIBADD   += $(UROM_LIBADD)
 libnccl_net_la_LDFLAGS  += $(UROM_LDFLAGS)
 endif
+
+if HAVE_UCC
+libnccl_net_la_CPPFLAGS += -DHAVE_UCC $(UCC_CPPFLAGS)
+libnccl_net_la_LIBADD   += $(UCC_LIBADD)
+libnccl_net_la_LDFLAGS  += $(UCC_LDFLAGS)
+endif
