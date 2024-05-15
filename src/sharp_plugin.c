@@ -145,6 +145,114 @@ struct ncclUccInfo {
 };
 
 struct ncclUccInfo ucc_info;
+
+static __inline__ ucc_datatype_t ucc_typeConvert(ncclDataType_t type) {
+  switch (type) {
+  case ncclInt8:
+    return UCC_DT_INT8;
+  case ncclUint8:
+    return UCC_DT_UINT8;
+  case ncclInt32:
+    return UCC_DT_INT32;
+  case ncclUint32:
+    return UCC_DT_UINT32;
+  case ncclInt64:
+    return UCC_DT_INT64;
+  case ncclUint64:
+    return UCC_DT_UINT64;
+  case ncclFloat16:
+    return UCC_DT_FLOAT16;
+  case ncclFloat32:
+    return UCC_DT_FLOAT32;
+  case ncclFloat64:
+    return UCC_DT_FLOAT64;
+  default:
+    return -1;
+  }
+}
+
+static __inline__ ucc_reduction_op_t ucc_opConvert(ncclRedOp_t op) {
+  switch (op) {
+  case ncclSum:
+    return UCC_OP_SUM;
+  case ncclProd:
+    return UCC_OP_PROD;
+  case ncclMax:
+    return UCC_OP_MAX;
+  case ncclMin:
+    return UCC_OP_MIN;
+  case ncclAvg:
+    return UCC_OP_AVG;
+  default:
+    return -1;
+  }
+}
+
+int ncclUCCAllGather(void *context, void *src_buf, void *recv_buf, int len) {
+//  struct ncclUCCCollComm *cComm = (struct ncclUCCCollComm *)context;
+  struct ncclSharpCollComm* cComm = (struct ncclSharpCollComm*)context;
+
+  nccl_p2p_plugin_t p2p_plugin;
+  void *rMhandle = NULL, *sMhandle = NULL;
+
+  assert(cComm->recvComm != NULL);
+  assert(cComm->sendComm != NULL);
+
+  p2p_plugin = nccl_p2p_get_plugin_type();
+  if (p2p_plugin != NCCL_P2P_UCX) {
+    NCCLCHECK(ncclNetPlugin_v7.regMr(cComm->recvComm, recv_buf,
+                                       cComm->nranks * len, NCCL_PTR_HOST,
+                                       &rMhandle));
+    NCCLCHECK(ncclNetPlugin_v7.regMr(cComm->sendComm, recv_buf,
+                                       cComm->nranks * len, NCCL_PTR_HOST,
+                                       &sMhandle));
+  }
+
+  int speer = cComm->rank;
+  memcpy(recv_buf + speer * len, src_buf, len);
+  for (int i = 0; i < cComm->nranks - 1; i++) {
+    void *srequest = NULL, *rrequest = NULL;
+    int rpeer = (speer - 1 + cComm->nranks) % cComm->nranks;
+    while (srequest == NULL || rrequest == NULL) {
+      void *rbuf = ((char *)recv_buf) + rpeer * len;
+      int tag = 0x69;
+      if (srequest == NULL)
+        NCCLCHECK(ncclNetPlugin_v7.isend(cComm->sendComm,
+                                           ((char *)recv_buf) + speer * len,
+                                           len, tag, sMhandle, &srequest));
+      if (rrequest == NULL)
+        NCCLCHECK(ncclNetPlugin_v7.irecv(cComm->recvComm, 1, &rbuf, &len,
+                                           &tag, &rMhandle, &rrequest));
+    }
+    while (srequest || rrequest) {
+      int done;
+      if (rrequest)
+        NCCLCHECK(ncclNetPlugin_v7.test(rrequest, &done, NULL));
+      if (done)
+        rrequest = NULL;
+      if (srequest)
+        NCCLCHECK(ncclNetPlugin_v7.test(srequest, &done, NULL));
+      if (done)
+        srequest = NULL;
+    }
+    speer = rpeer;
+  }
+  if (p2p_plugin != NCCL_P2P_UCX) {
+    NCCLCHECK(ncclNetPlugin_v7.deregMr(cComm->recvComm, rMhandle));
+    NCCLCHECK(ncclNetPlugin_v7.deregMr(cComm->sendComm, sMhandle));
+  }
+
+  return 0;
+}
+
+ucc_status_t UCC_oob_allgather(void *src_buf, void *recv_buf, size_t size,
+                               void *coll_info, void **request) {
+  NCCLCHECK(ncclUCCAllGather(coll_info, src_buf, recv_buf, (int)size))
+  return UCC_OK;
+}
+
+ucc_status_t UCC_oob_req_test(void *request) { return UCC_OK; }
+ucc_status_t UCC_oob_req_free(void *request) { return UCC_OK; }
 #endif
 
 size_t            staging_buffer_len = 0;
@@ -312,29 +420,6 @@ static urom_status_t oob_allgather_free(void *req)
 {
   return UROM_OK;
 }
-#else
-static ucc_status_t oob_allgather(void *sbuf, void *rbuf, size_t msglen,
-                                  void *coll_info, void **req)
-{
-  MPI_Comm comm = (MPI_Comm) (uintptr_t)coll_info;
-  MPI_Request request;
-  MPI_Iallgather(sbuf, msglen, MPI_BYTE, rbuf, msglen, MPI_BYTE, comm, &request);
-  *req = request;
-  MPI_Wait(&request, MPI_STATUS_IGNORE);
-  *req = UCC_OK;
-  return UCC_OK;
-}
-
-static ucc_status_t oob_allgather_test(void *req)
-{
-  /* FERROL: allgather is implemented as blocking, just return OK */
-  return UCC_OK;
-}
-
-static ucc_status_t oob_allgather_free(void *req)
-{
-  return UCC_OK;
-}
 #endif
 
 #ifdef HAVE_UROM
@@ -493,7 +578,6 @@ int ncclUromInit(void) {
   return 0;
 }
 
-
 /* FIXME: is this still necessary? */
 int buffer_export_ucc(ucp_context_h ucp_context, void *buf, size_t len,
                       struct export_buf *ebuf)
@@ -584,10 +668,12 @@ int ucp_init_ex(ucp_context_h *ucp_ctx, ucp_worker_h *ucp_worker, ucp_address_t 
 }
 #endif
 
-#ifdef HAVE_UCC
+#if 1
+//#ifdef HAVE_UCC
 /* UCC addition */
 ucc_status_t ucc_coll_init(int rank, void *src, void *dst,
                            size_t scount, size_t rcount, ucc_datatype_t dt,
+                           ucc_reduction_op_t op, 
                            ucc_coll_type_t coll_type, ucc_coll_req_h *req)
 {
   reg_keys_t *keys;
@@ -611,6 +697,10 @@ ucc_status_t ucc_coll_init(int rank, void *src, void *dst,
   coll_args->dst.info.count = rcount;
   coll_args->dst.info.datatype = dt;
   coll_args->dst.info.mem_type = UCC_MEMORY_TYPE_UNKNOWN;
+
+  if (coll_type == UCC_COLL_TYPE_ALLREDUCE) {
+    coll_args->op = op;
+  }
 
   /* find keys */
   useGWB = getenv("NCCL_UCC_USEGWB");
@@ -680,7 +770,6 @@ int ncclUCCInit(void) {
   ucc_lib_config_release(lib_config);
 
   /* F: could check for errors here.. */
-
   return 0;
 }
 
@@ -701,9 +790,9 @@ static ucc_status_t ncclUccCtxCreate(void *buf, size_t len)
   map.len = len;
 
   ctx_params.mask = UCC_CONTEXT_PARAM_FIELD_OOB;
-  ctx_params.oob.allgather = oob_allgather;
-  ctx_params.oob.req_test = oob_allgather_test;
-  ctx_params.oob.req_free = oob_allgather_free;
+  ctx_params.oob.allgather = UCC_oob_allgather;
+  ctx_params.oob.req_test = UCC_oob_req_test;
+  ctx_params.oob.req_free = UCC_oob_req_free;
   ctx_params.oob.coll_info = (void *)MPI_COMM_WORLD;
   ctx_params.oob.n_oob_eps = size;
   ctx_params.oob.oob_ep = rank;
@@ -742,9 +831,9 @@ static ucc_status_t ncclUccTeamCreate(size_t rank, size_t size)
   ucc_team_params_t team_params = {
     .mask = UCC_TEAM_PARAM_FIELD_EP | UCC_TEAM_PARAM_FIELD_OOB | UCC_TEAM_PARAM_FIELD_FLAGS,
     .oob = {
-      .allgather = oob_allgather,
-      .req_test = oob_allgather_test,
-      .req_free = oob_allgather_free,
+      .allgather = UCC_oob_allgather,
+      .req_test = UCC_oob_req_test,
+      .req_free = UCC_oob_req_free,
       .coll_info = MPI_COMM_WORLD,
       .n_oob_eps = size,
       .oob_ep = rank,
@@ -1356,11 +1445,11 @@ ncclResult_t ncclSharpIallreduce(void* collComm, void* sendData, void* recvData,
   urom_worker_push_cmdq(urom_info.worker, 0, cmd);
 #endif
 
-#ifdef HAVE_UCC
+//#ifdef HAVE_UCC
   ucc_coll_req_h reqh;
-  ucc_coll_init(rank, sendData, recvData, dt_size * count, dt_size * count, UCC_DT_FLOAT32, UCC_COLL_TYPE_ALLREDUCE, &reqh);
+  ucc_coll_init(rank, sendData, recvData, dt_size * count, dt_size * count, ucc_typeConvert(dataType), ucc_opConvert(redOp), UCC_COLL_TYPE_ALLREDUCE, &reqh);
   req->req_h = reqh;
-#endif
+//#endif
   req->dst = recvData;
   req->len = dt_size * count;
   req->id = num_outstanding;
@@ -1431,7 +1520,7 @@ ncclResult_t ncclSharpIallgather(void* collComm, void* sendData, int nRecvParts,
   ucc_coll_req_h reqh;
   if (bytesPerRank == recvParts[0].size) {
     ucc_coll_init(rank, sendData, recvParts[0].address, bytesPerRank, recvParts[0].size,
-                  UCC_DT_INT8, UCC_COLL_TYPE_ALLGATHER, &reqh);
+                  UCC_DT_INT8, 0, UCC_COLL_TYPE_ALLGATHER, &reqh);
   }
   req->req_h = reqh;
 #endif
