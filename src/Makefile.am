@@ -41,7 +41,8 @@ libnccl_net_la_LDFLAGS  += $(UROM_LDFLAGS)
 endif
 
 if HAVE_UCC
-libnccl_net_la_CPPFLAGS += -DHAVE_UCC $(UCC_CPPFLAGS)
+libnccl_net_la_CPPFLAGS += -DHAVE_UCC_PLUGIN $(UCC_CPPFLAGS) $(UCX_CPPFLAGS)
 libnccl_net_la_LIBADD   += $(UCC_LIBADD)
-libnccl_net_la_LDFLAGS  += $(UCC_LDFLAGS)
+libnccl_net_la_LDFLAGS  += $(UCC_LDFLAGS) $(UCX_LDFLAGS)
+libnccl_net_la_SOURCES  += ucc_plugin.c
 endif

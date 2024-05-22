@@ -21,22 +21,6 @@
 #include "utils.h"
 #include "nccl.h"
 
-#if defined(HAVE_UROM) || defined(HAVE_UCC)
-#include "ucp/api/ucp.h"
-#include "ucc/api/ucc.h"
-#include <mpi.h>
-
-#define UCC_ERROR(format, ...) \
-          fprintf(stderr, "UCC ERROR: %s:%d - %s() " format, __FILE__, __LINE__, __FUNCTION__, ## __VA_ARGS__)
-#endif
-
-#ifdef HAVE_UROM
-#include "urom/api/urom.h"
-
-#define UROM_ERROR(format, ...) \
-          fprintf(stderr, "UROM ERROR: %s:%d - %s() " format, __FILE__, __LINE__, __FUNCTION__, ## __VA_ARGS__)
-#endif
-
 extern ncclNet_v8_t ncclNetPlugin_v8;
 extern ncclNet_v7_t ncclNetPlugin_v7;
 extern ncclNet_v6_t ncclNetPlugin_v6;
@@ -86,65 +70,6 @@ struct ncclSharpInfo {
   uint64_t hostId;
   uint64_t jobId;
 };
-
-typedef struct reg_keys {
-    uint64_t xgvmi_flag;
-    size_t src_len;
-    size_t dst_len;
-    char rkeys[];
-} reg_keys_t;
-
-typedef struct mapped_mem {
-    ucp_mem_h memh;
-    void *src;
-    size_t len;
-    size_t key_len;
-    void *key;
-} mapped_mem_t;
-
-size_t map_beg = 0;
-size_t map_end = 0;
-mapped_mem_t map_array[128];
-
-#ifdef HAVE_UROM
-int num_outstanding = 0;
-struct ncclUromInfo {
-  urom_service_h  service;
-  urom_worker_h   worker;
-  urom_domain_h   udom;
-  ucc_context_h   ucc_ctx;
-  ucc_team_h      ucc_team;
-  uint8_t         worker_addr[UROM_WORKER_ADDR_MAX_LEN];
-  uint64_t        worker_id;
-};
-
-struct ncclUromInfo urom_info;
-struct export_buf {
-    ucp_context_h ucp_context;
-    ucp_mem_h     memh;
-    void         *packed_memh;
-    size_t        packed_memh_len;
-    void         *packed_key;
-    size_t        packed_key_len;
-    uint64_t      memh_id;
-};
-
-ucp_context_h ucp_ctx;
-ucp_worker_h ucp_worker;
-ucp_address_t *ucp_worker_addr;
-size_t ucp_worker_addr_len;
-struct export_buf ebuf;
-#endif
-
-#ifdef HAVE_UCC
-int num_outstanding = 0;
-struct ncclUccInfo {
-  ucc_lib_h       ucc_lib;
-  ucc_context_h   ucc_ctx;
-  ucc_team_h      ucc_team;
-};
-
-struct ncclUccInfo ucc_info;
 
 static __inline__ ucc_datatype_t ucc_typeConvert(ncclDataType_t type) {
   switch (type) {
@@ -253,7 +178,6 @@ ucc_status_t UCC_oob_allgather(void *src_buf, void *recv_buf, size_t size,
 
 ucc_status_t UCC_oob_req_test(void *request) { return UCC_OK; }
 ucc_status_t UCC_oob_req_free(void *request) { return UCC_OK; }
-#endif
 
 size_t            staging_buffer_len = 0;
 void             *staging_buffer;
@@ -263,9 +187,7 @@ typedef struct request {
     void *dst;
     size_t len;
     void *keys;
-#ifdef HAVE_UCC
     void *req_h;
-#endif
 } request_t;
 
 #define STAGING_BUF_LEN  536870912
@@ -395,468 +317,7 @@ int ncclSharpOobBcast(void *ctx, void *buf, int size, int root) {
   free(tmp);
   return 0;
 }
-
-#ifdef HAVE_UROM
-/* UROM addition */
-static urom_status_t oob_allgather(void *sbuf, void *rbuf, size_t msglen,
-                                   void *coll_info, void **req)
-{
-  MPI_Comm comm = (MPI_Comm) (uintptr_t)coll_info;
-  MPI_Request request;
-  MPI_Iallgather(sbuf, msglen, MPI_BYTE, rbuf, msglen, MPI_BYTE, comm, &request);
-  *req = request;
-  MPI_Wait(&request, MPI_STATUS_IGNORE);
-  *req = UROM_OK;
-  return UROM_OK;
-}
-
-static urom_status_t oob_allgather_test(void *req)
-{
-  /* FERROL: allgather is implemented as blocking, just return OK */
-  return UROM_OK;
-}
-
-static urom_status_t oob_allgather_free(void *req)
-{
-  return UROM_OK;
-}
-#endif
-
-#ifdef HAVE_UROM
-urom_worker_cmd_t *urom_coll_init(int rank, void *src, void *dst,
-                                  size_t scount, size_t rcount, ucc_datatype_t dt,
-                                  ucc_coll_type_t coll_type, int use_xgvmi)
-{
-  reg_keys_t *keys = malloc(sizeof(reg_keys_t) + 1024); // FIXME: not 1024? 
-  urom_worker_cmd_t *coll_cmd;
-  ucc_coll_args_t *coll_args;
-
-  /* find keys */
-  for (int i = 0; i < map_end; i++) {
-    if (map_array[i].src <= src &&
-      (map_array[i].src + map_array[i].len) >= src) {
-        keys->src_len = map_array[i].key_len;
-        memcpy(keys->rkeys, map_array[i].key, keys->src_len);
-        break;
-    }
-  }
-  // error check?
-  for (int i = 0; i < map_end; i++) {
-    if (map_array[i].src <= dst &&
-      (map_array[i].src + map_array[i].len) >= dst) {
-      keys->dst_len = map_array[i].key_len;
-      memcpy(keys->rkeys + keys->src_len, map_array[i].key, keys->dst_len);
-      break;
-    }
-  }
-
-  /* setup coll args */
-  coll_args = (ucc_coll_args_t *)malloc(sizeof(ucc_coll_args_t));
-  if (!coll_args) {
-    return NULL;
-  }
-
-  coll_args->mask = UCC_COLL_ARGS_FIELD_GLOBAL_WORK_BUFFER | UCC_COLL_ARGS_FIELD_FLAGS;
-  coll_args->flags = UCC_COLL_ARGS_FLAG_MEM_MAPPED_BUFFERS;
-  coll_args->coll_type = coll_type;
-  coll_args->src.info.buffer = src;
-  coll_args->src.info.count = scount;
-  coll_args->src.info.datatype = dt;
-  coll_args->src.info.mem_type = UCC_MEMORY_TYPE_UNKNOWN;
-  coll_args->dst.info.buffer = dst;
-  coll_args->dst.info.count = rcount;
-  coll_args->dst.info.datatype = dt;
-  coll_args->dst.info.mem_type = UCC_MEMORY_TYPE_UNKNOWN;
-  coll_args->global_work_buffer = keys;
-
-  /* setup worker command */
-  coll_cmd = (urom_worker_cmd_t *)malloc(sizeof(urom_worker_cmd_t));
-  if (!coll_cmd) {
-    free(coll_args);
-    return NULL;
-  }
-
-  coll_cmd->cmd_type = UROM_WORKER_CMD_UCC;
-  coll_cmd->ucc.dpu_worker_id = rank;
-  coll_cmd->ucc.cmd_type = UROM_WORKER_CMD_UCC_COLL;
-  coll_cmd->ucc.coll_cmd.team = urom_info.ucc_team;
-  coll_cmd->ucc.coll_cmd.use_xgvmi = use_xgvmi;
-  coll_cmd->ucc.coll_cmd.work_buffer = coll_args->global_work_buffer;
-  coll_cmd->ucc.coll_cmd.work_buffer_size = sizeof(reg_keys_t) + keys->src_len + keys->dst_len;
-
-  /* END UROM addition */
-  return coll_cmd;
-}
-
-int ncclUromInit(void) {
-  urom_service_h service;
-  urom_worker_h worker;
-  urom_worker_params_t worker_params;
-  uint64_t worker_id = UROM_WORKER_ID_ANY;
-  uint8_t worker_addr[UROM_WORKER_ADDR_MAX_LEN];
-  size_t  worker_addr_len = UROM_WORKER_ADDR_MAX_LEN;
-  urom_device_t *dev;
-  struct urom_device *device_list;
-  int num_devices;
-  char *dev_name = NULL;
-  urom_service_params_t service_params = {};
-  urom_status_t status;
-  int a;
-
-    MPI_Initialized(&a);
-  if (!a) {
-    MPI_Init(NULL, NULL);
-    }
-    num_outstanding = 0;
-
-  /* connect to uromd */
-  status = urom_get_device_list(&device_list, &num_devices);
-  if (status != UROM_OK) {
-    printf("barf\n");
-    return -1;
-  }
-
-  dev = device_list;
-  while (dev) {
-    if (dev_name) {
-      if (!strcmp(dev_name, dev->name)) {
-        break;
-      }
-    } else {
-      break;
-    }
-    dev = dev->next;
-  }
-
-  if (!dev) {
-    printf("no device\n");
-    return -2;
-  }
-
-  service_params.flags = UROM_SERVICE_PARAM_DEVICE;
-  service_params.device = dev;
-  status = urom_service_connect(&service_params, &service);
-  if (status != UROM_OK) {
-    fprintf(stderr, "urom_service_connect() returned error: %s\n",
-            urom_status_string(status));
-    status = urom_free_device_list(device_list);
-    assert (status == UROM_OK);
-    return -1;
-  };
-
-  urom_info.service = service;
-
-  printf("Connected!\n");
-  status = urom_free_device_list(device_list);
-
-  /* Spawn worker */
-  status = urom_worker_spawn(service, UROM_WORKER_TYPE_UCC, worker_addr,
-                             &worker_addr_len, &worker_id);
-  if (status != UROM_OK) {
-      printf("urom_worker_spawn() returned error: %s\n",
-             urom_status_string(status));
-      return -1;
-  }   
-
-  printf("Spawned worker ID: %lu\n", worker_id);
-
-  /* Worker connect */
-  worker_params.serviceh        = service;
-  worker_params.addr            = worker_addr;
-  worker_params.addr_len        = worker_addr_len;
-  worker_params.num_cmd_notifyq = 1;
-
-  status = urom_worker_connect(&worker_params, &worker);
-  if (status != UROM_OK) {
-      printf("urom_worker_connect() returned error: %s\n",
-             urom_status_string(status));
-      return -1; 
-  }
-
-  urom_info.worker = worker;
-
-  return 0;
-}
-
-/* FIXME: is this still necessary? */
-int buffer_export_ucc(ucp_context_h ucp_context, void *buf, size_t len,
-                      struct export_buf *ebuf)
-{
-    ucs_status_t           ucs_status;
-    ucp_mem_map_params_t   params;
-    ucp_memh_pack_params_t pack_params;
-
-    ebuf->ucp_context = ucp_context;
-
-    params.field_mask =
-        UCP_MEM_MAP_PARAM_FIELD_ADDRESS | UCP_MEM_MAP_PARAM_FIELD_LENGTH;
-    params.address = buf;
-    params.length  = len;
-
-    ucs_status = ucp_mem_map(ucp_context, &params, &ebuf->memh);
-    assert(ucs_status == UCS_OK);
-
-    pack_params.field_mask = UCP_MEMH_PACK_PARAM_FIELD_FLAGS;
-    pack_params.flags      = UCP_MEMH_PACK_FLAG_EXPORT;
-
-    ucs_status = ucp_memh_pack(ebuf->memh, &pack_params, &ebuf->packed_memh,
-                               &ebuf->packed_memh_len);
-    if (ucs_status != UCS_OK) {
-        printf("ucp_memh_pack() returned error: %s\n",
-               ucs_status_string(ucs_status));
-        ebuf->packed_memh     = NULL;
-        ebuf->packed_memh_len = 0;
-    }
-    ucs_status = ucp_rkey_pack(ucp_context, ebuf->memh, &ebuf->packed_key,
-                               &ebuf->packed_key_len);
-    if (UCS_OK != ucs_status) {
-        printf("ucp_rkey_pack() returned error: %s\n",
-               ucs_status_string(ucs_status));
-        return UROM_ERR_NO_RESOURCE;
-    }
-
-    printf("ucp_memh_pack() packed length: %ld\n", ebuf->packed_memh_len);
-    printf("ucp_rkey_pack() packed length: %ld\n", ebuf->packed_key_len);
-    return 0;
-}
-
-int ucp_init_ex(ucp_context_h *ucp_ctx, ucp_worker_h *ucp_worker, ucp_address_t **ucp_addr, size_t *len)
-{
-    ucs_status_t        ucs_status;
-    ucp_config_t       *ucp_config;
-    ucp_params_t        ucp_params;
-    ucp_context_h       ucp_context;
-    ucp_worker_params_t worker_params;
-    ucp_address_t      *worker_addr;
-    ucp_worker_h        worker;
-    size_t              length;
-
-    ucs_status = ucp_config_read(NULL, NULL, &ucp_config);
-    assert(ucs_status == UCS_OK);
-
-    ucp_params.field_mask = UCP_PARAM_FIELD_FEATURES;
-    ucp_params.features   = UCP_FEATURE_TAG | UCP_FEATURE_RMA |
-                          UCP_FEATURE_AMO64 | UCP_FEATURE_EXPORTED_MEMH;
-
-    ucs_status = ucp_init(&ucp_params, ucp_config, &ucp_context);
-    if (ucs_status != UCS_OK) {
-        printf("error on ucp init\n");
-        return -1;
-    }
-
-    *ucp_ctx = ucp_context;
-    worker_params.field_mask  = UCP_WORKER_PARAM_FIELD_THREAD_MODE;
-    worker_params.thread_mode = UCS_THREAD_MODE_SINGLE;
-
-    ucs_status = ucp_worker_create(ucp_context, &worker_params, &worker);
-    if (ucs_status != UCS_OK) {
-        printf("error on worker create\n");
-        return -1;
-    }
-
-    *ucp_worker = worker;
-    ucs_status  = ucp_worker_get_address(worker, &worker_addr, &length);
-    if (ucs_status != UCS_OK) {
-        printf("failed to get address\n");
-        return -1;
-    }
-
-    *ucp_addr = worker_addr;
-    *len      = length;
-
-    return 0;
-}
-#endif
-
-#if 1
-//#ifdef HAVE_UCC
-/* UCC addition */
-ucc_status_t ucc_coll_init(int rank, void *src, void *dst,
-                           size_t scount, size_t rcount, ucc_datatype_t dt,
-                           ucc_reduction_op_t op, 
-                           ucc_coll_type_t coll_type, ucc_coll_req_h *req)
-{
-  reg_keys_t *keys;
-  ucc_coll_args_t *coll_args;
-  ucc_coll_req_h   coll_req;
-  ucc_status_t     ucc_status;
-  char *useGWB;
-
-  /* setup coll args */
-  coll_args = (ucc_coll_args_t *)malloc(sizeof(ucc_coll_args_t));
-  if (!coll_args) {
-    return UCC_ERR_NO_MEMORY;
-  }
-  coll_args->mask = 0; 
-  coll_args->coll_type = coll_type;
-  coll_args->src.info.buffer = src;
-  coll_args->src.info.count = scount;
-  coll_args->src.info.datatype = dt;
-  coll_args->src.info.mem_type = UCC_MEMORY_TYPE_UNKNOWN;
-  coll_args->dst.info.buffer = dst;
-  coll_args->dst.info.count = rcount;
-  coll_args->dst.info.datatype = dt;
-  coll_args->dst.info.mem_type = UCC_MEMORY_TYPE_UNKNOWN;
-
-  if (coll_type == UCC_COLL_TYPE_ALLREDUCE) {
-    coll_args->op = op;
-  }
-
-  /* find keys */
-  useGWB = getenv("NCCL_UCC_USEGWB");
-  if (useGWB != NULL) {
-    keys = malloc(sizeof(reg_keys_t) + 1024); // FIXME: not 1024?
-    if (!keys) {
-      fprintf(stderr, "Out of memory\n");
-      return UCC_ERR_NO_MEMORY;
-    }
-
-    for (int i = 0; i < map_end; i++) {
-      if (map_array[i].src <= src &&
-        (map_array[i].src + map_array[i].len) >= src) {
-          keys->src_len = map_array[i].key_len;
-          memcpy(keys->rkeys, map_array[i].key, keys->src_len);
-          break;
-      }
-    }
-    // error check?
-    for (int i = 0; i < map_end; i++) {
-      if (map_array[i].src <= dst &&
-        (map_array[i].src + map_array[i].len) >= dst) {
-        keys->dst_len = map_array[i].key_len;
-        memcpy(keys->rkeys + keys->src_len, map_array[i].key, keys->dst_len);
-        break;
-      }
-    }
-
-    coll_args->mask |= UCC_COLL_ARGS_FIELD_GLOBAL_WORK_BUFFER;
-    coll_args->global_work_buffer = keys;
-  }
-
-  ucc_status = ucc_collective_init(coll_args, &coll_req, ucc_info.ucc_team);
-  if (ucc_status != UCC_OK) {
-    fprintf(stderr, "Error in UCC\n");
-    return ucc_status;
-  }
-
-  *req = coll_req;
-  return UCC_OK;
-}
-
-int ncclUCCInit(void) {
-  int a;
-
-  MPI_Initialized(&a);
-  if (!a) {
-    MPI_Init(NULL, NULL);
-  }
-  num_outstanding = 0;
-
-  ucc_lib_config_h lib_config;
-  ucc_lib_params_t lib_params;
-
-  lib_params.mask = UCC_LIB_PARAM_FIELD_THREAD_MODE;
-  lib_params.thread_mode = UCC_THREAD_MULTIPLE;
-
-  if (UCC_OK != ucc_lib_config_read("NCCL", NULL, &lib_config)) {
-    UCC_ERROR("UCC lib config read failed");
-    return -1;
-  }
-  if (UCC_OK != ucc_init(&lib_params, lib_config, &ucc_info.ucc_lib)) {
-    UCC_ERROR("UCC lib init failed");
-    ucc_lib_config_release(lib_config);
-    return -2;
-  }
-  ucc_lib_config_release(lib_config);
-
-  /* F: could check for errors here.. */
-  return 0;
-}
-
-static ucc_status_t ncclUccCtxCreate(void *buf, size_t len)
-{
-  ucc_status_t         ucc_status;
-  ucc_context_params_t ctx_params;
-  ucc_context_config_h ctx_config;
-  ucc_mem_map_t        map;
-  char                 str_buf[256];
-  int rank;
-  int size;
-
-  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-  MPI_Comm_size(MPI_COMM_WORLD, &size);
-
-  map.address = buf;
-  map.len = len;
-
-  ctx_params.mask = UCC_CONTEXT_PARAM_FIELD_OOB;
-  ctx_params.oob.allgather = UCC_oob_allgather;
-  ctx_params.oob.req_test = UCC_oob_req_test;
-  ctx_params.oob.req_free = UCC_oob_req_free;
-  ctx_params.oob.coll_info = (void *)MPI_COMM_WORLD;
-  ctx_params.oob.n_oob_eps = size;
-  ctx_params.oob.oob_ep = rank;
-  ctx_params.mem_params.segments = &map;
-  ctx_params.mem_params.n_segments = 1;
-
-  if (UCC_OK != (ucc_status = ucc_context_config_read(ucc_info.ucc_lib, NULL, &ctx_config))) {
-    UCC_ERROR("UCC context config read failed\n");
-    return ucc_status;
-  }
-  
-  if (UCC_OK != (ucc_status = ucc_context_config_modify(ctx_config, NULL,
-                                          "ESTIMATED_NUM_EPS", str_buf))) {
-      UCC_ERROR("UCC context config modify failed for estimated_num_eps");
-      goto cleanup_lib;
-  }
-
-  if (UCC_OK != (ucc_status = ucc_context_create(ucc_info.ucc_lib, &ctx_params, ctx_config,
-                                  &ucc_info.ucc_ctx))) {
-    UCC_ERROR("ucc context create failed");
-    ucc_context_config_release(ctx_config);
-    goto cleanup_lib;
-  }
-  ucc_context_config_release(ctx_config);
-
-  return UCC_OK;
-cleanup_lib:
-  ucc_finalize(ucc_info.ucc_lib);
-  return ucc_status; 
-}
-/* nccl team create */
-
-static ucc_status_t ncclUccTeamCreate(size_t rank, size_t size)
-{
-  ucc_status_t status;
-  ucc_team_params_t team_params = {
-    .mask = UCC_TEAM_PARAM_FIELD_EP | UCC_TEAM_PARAM_FIELD_OOB | UCC_TEAM_PARAM_FIELD_FLAGS,
-    .oob = {
-      .allgather = UCC_oob_allgather,
-      .req_test = UCC_oob_req_test,
-      .req_free = UCC_oob_req_free,
-      .coll_info = MPI_COMM_WORLD,
-      .n_oob_eps = size,
-      .oob_ep = rank,
-    },
-    .ep = rank,
-    .flags = UCC_TEAM_FLAG_COLL_WORK_BUFFER,
-  };
-
-  if (UCC_OK != (status = ucc_team_create_post(&ucc_info.ucc_ctx, 1, &team_params, &ucc_info.ucc_team))) {
-    UCC_ERROR("team create post failed\n");
-    return status;
-  }
-
-  while (UCC_INPROGRESS == (status = ucc_team_create_test(ucc_info.ucc_team))) {}
-  if (UCC_OK != status) {
-    UCC_ERROR("team create failed\n");
-    return status;
-  }
-  return UCC_OK;
-}
     
-#endif
-
 ncclResult_t ncclSharpInit(ncclDebugLogger_t logFunction) {
   struct timeval tval;
   gettimeofday(&tval, NULL);
@@ -867,15 +328,6 @@ ncclResult_t ncclSharpInit(ncclDebugLogger_t logFunction) {
   setenv("SHARP_COLL_NUM_COLL_GROUP_RESOURCE_ALLOC_THRESHOLD", "0", 0);
   setenv("SHARP_COLL_LOCK_ON_COMM_INIT", "1", 0);
   setenv("SHARP_COLL_LOG_LEVEL", "3", 0);
-
-#ifdef HAVE_UROM
-  ncclUromInit();
-#endif
-
-#ifdef HAVE_UCC
-  ncclUCCInit();
-#endif
-
   return ncclNetPlugin_v7.init(logFunction);
 }
 
@@ -915,7 +367,6 @@ ncclResult_t ncclSharpListen(int dev, void* opaqueHandle, void** listenComm) {
 
 
 ncclResult_t ncclSharpConnect(void* handles[], int nranks, int rank, void* listenComm, void** collComm) {
-#if !defined(HAVE_UCC) && !defined(HAVE_UROM)
   struct ncclSharpListenComm* lComm = (struct ncclSharpListenComm*)listenComm;
   struct ncclSharpCollComm* cComm;
 
@@ -1031,162 +482,6 @@ ncclResult_t ncclSharpConnect(void* handles[], int nranks, int rank, void* liste
     return ncclInternalError;
   }
   *collComm = cComm;
-#endif
-  int size;
-  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-  MPI_Comm_size(MPI_COMM_WORLD, &size);
-
-  /* let's create endpoints here */
-  #ifdef HAVE_UROM
-  char *useUROM;
-  useUROM = getenv("NCCL_UROM_ENABLE");
-  if (useUROM != NULL) {
-    urom_status_t status;
-    urom_worker_notify_t *notif;
-    urom_mem_map_t  map = {};
-    size_t buffer_len;
-
-    /* create a staging buffer. F: should we remove? */
-    ucp_init_ex(&ucp_ctx, &ucp_worker, &ucp_worker_addr, &ucp_worker_addr_len);
-    staging_buffer = malloc(STAGING_BUF_LEN);
-    buffer_len = STAGING_BUF_LEN;
-    buffer_export_ucc(ucp_ctx, staging_buffer, buffer_len, &ebuf);
-
-    map.mask = UROM_WORKER_MEM_MAP_FIELD_BASE_VA | UROM_WORKER_MEM_MAP_FIELD_MKEY;
-    map.base_va = (uint64_t)staging_buffer;
-    map.len = buffer_len;
-    map.mkey = ebuf.packed_key;
-    map.mkey_len = ebuf.packed_key_len;
-
-    ucc_lib_params_t lib_params = {
-        .mask        = UCC_LIB_PARAM_FIELD_THREAD_MODE,
-        .thread_mode = UCC_THREAD_SINGLE,
-    };
-    urom_worker_cmd_t init_cmd = {
-        .cmd_type                  = UROM_WORKER_CMD_UCC,
-        .ucc.cmd_type              = UROM_WORKER_CMD_UCC_LIB_CREATE,
-        .ucc.lib_create_cmd.params = &lib_params,
-    };
-    urom_worker_cmd_t pass_dc_cmd = {
-        .cmd_type     = UROM_WORKER_CMD_UCC,
-        .ucc.cmd_type = UROM_WORKER_CMD_CREATE_PASSIVE_DATA_CHANNEL,
-        .ucc.pass_dc_create_cmd.ucp_addr = ucp_worker_addr,
-        .ucc.pass_dc_create_cmd.addr_len = ucp_worker_addr_len,
-    };
-    urom_worker_cmd_t ctx_cmd = {
-        .cmd_type          = UROM_WORKER_CMD_UCC,
-        .ucc.dpu_worker_id = rank,
-        .ucc.cmd_type      = UROM_WORKER_CMD_UCC_CONTEXT_CREATE,
-        .ucc.context_create_cmd =
-            {
-              .start   = 0,
-              .stride  = 1,
-              .size    = size,
-              .base_va = staging_buffer,
-              .len     = buffer_len,
-          },
-    };
-    urom_worker_cmd_t team_cmd = {
-      .cmd_type          = UROM_WORKER_CMD_UCC,
-      .ucc.dpu_worker_id = rank,
-      .ucc.cmd_type      = UROM_WORKER_CMD_UCC_TEAM_CREATE,
-      .ucc.team_create_cmd =
-          {
-              .start  = 0,
-              .stride = 1,
-              .size   = size,
-          },
-    };
-
-    /* create a domain */
-    urom_domain_params_t udom_params = {
-      .flags = UROM_DOMAIN_WORKER_ADDR,
-      .mask = UROM_DOMAIN_PARAM_FIELD_OOB |
-              UROM_DOMAIN_PARAM_FIELD_WORKER |
-              UROM_DOMAIN_PARAM_FIELD_WORKER_ID |
-              UROM_DOMAIN_PARAM_FIELD_MEM_MAP,
-      .oob =
-          {
-              .allgather     = oob_allgather,
-              .req_test      = oob_allgather_test,
-              .req_free      = oob_allgather_free,
-              .coll_info     = MPI_COMM_WORLD,
-              .n_oob_indexes = size,
-              .oob_index     = rank,
-          },
-      .domain_worker_id = rank,
-      .workers          = &urom_info.worker,
-      .num_workers      = 1,
-      .domain_size      = size,
-      .mem_map = 
-        {
-        .segments = &map,
-        .n_segments = 1,
-        },
-    };
-    status = urom_domain_create_post(&udom_params, &urom_info.udom);
-    if (status < UROM_OK) {
-        UROM_ERROR("%s\n", urom_status_string(status));
-        return status;
-    }
-    while (UROM_INPROGRESS == (status = urom_domain_create_test(urom_info.udom)))
-      ;
-
-    if (status < UROM_OK) {
-      UROM_ERROR("%s\n", urom_status_string(status));
-      return status;
-    }
-    /* create a context */
-    urom_worker_push_cmdq(urom_info.worker, 0, &init_cmd);
-    while (UROM_ERR_QUEUE_EMPTY ==
-           (status = urom_worker_pop_notifyq(urom_info.worker, 0, &notif))) {
-        sched_yield();
-    }
-    urom_worker_push_cmdq(urom_info.worker, 0, &pass_dc_cmd);
-    while (UROM_ERR_QUEUE_EMPTY ==
-           (status = urom_worker_pop_notifyq(urom_info.worker, 0, &notif))) {
-        sched_yield();
-    }
-    urom_worker_push_cmdq(urom_info.worker, 0, &ctx_cmd);
-    while (UROM_ERR_QUEUE_EMPTY ==
-           (status = urom_worker_pop_notifyq(urom_info.worker, 0, &notif))) {
-        sched_yield();
-    }
-    team_cmd.ucc.team_create_cmd.context_h = (void *)notif->ucc.context_create_nqe.context;
-    urom_info.ucc_ctx = notif->ucc.context_create_nqe.context;
-    /* create a team */
-    urom_worker_push_cmdq(urom_info.worker, 0, &team_cmd);
-    while (UROM_ERR_QUEUE_EMPTY ==
-           (status = urom_worker_pop_notifyq(urom_info.worker, 0, &notif))) {
-        sched_yield();
-    }
-    urom_info.ucc_team = notif->ucc.team_create_nqe.team;
-  }
-  #endif
-
-  #ifdef HAVE_UCC
-  char *useUCC;
-  useUCC = getenv("NCCL_UCC_ENABLE");
-  if (useUCC != NULL) {
-    ucc_status_t status;
-    size_t buffer_len;
-
-    /* create a staging buffer. F: should we remove? */
-    staging_buffer = malloc(STAGING_BUF_LEN);
-    buffer_len = STAGING_BUF_LEN;
-
-    status = ncclUccCtxCreate(staging_buffer, buffer_len);
-    if (status != UCC_OK) {
-      return !ncclSuccess;
-    }
-
-    status = ncclUccTeamCreate(rank, size);
-    if (status != UCC_OK) {
-      // ctx destroy
-      return !ncclSuccess;
-    }
-  }
-  #endif
 
   return ncclSuccess;
 }
@@ -1225,7 +520,6 @@ ncclResult_t ncclSharpRegMrDmaBuf(void* collComm, void* data, size_t size, int t
 }
 
 ncclResult_t ncclSharpRegMr(void* collComm, void* data, size_t size, int type, void** mhandle) {
-#if 0
   struct ncclSharpCollComm* cComm = (struct ncclSharpCollComm*)collComm;
 
   struct ncclSharpMemHandle *mh;
@@ -1241,40 +535,15 @@ ncclResult_t ncclSharpRegMr(void* collComm, void* data, size_t size, int type, v
   NCCLCHECK(ncclNetPlugin_v8.regMr(cComm->recvComm, data, size, type, &mh->ncclIbMr));
 
   *mhandle = mh;
-#else
-  #ifdef HAVE_UROM
-    ucp_mem_map_params_t mem_params;
-    ucs_status_t ucs_status;
-    mapped_mem_t *map = &map_array[map_end];
-
-    mem_params.field_mask = UCP_MEM_MAP_PARAM_FIELD_ADDRESS | UCP_MEM_MAP_PARAM_FIELD_LENGTH;
-    mem_params.address = data;
-    mem_params.length = size;
-    ucs_status = ucp_mem_map(ucp_ctx, &mem_params, &map->memh);
-    assert (ucs_status == UCS_OK);
-
-    ucs_status = ucp_rkey_pack(ucp_ctx, map->memh, &map->key, &map->key_len);
-    assert (ucs_status == UCS_OK);
-
-    map->src = data;
-    map->len = size;
-
-    map_end = (map_end + 1) % 128;
-    *mhandle = map;
-  #endif
-#endif
-    printf("noop 2\n");
    return ncclSuccess;
 }
 
 
 ncclResult_t ncclSharpRegMr_v7(void* collComm, void* data, int size, int type, void** mhandle) {
-    return ncclSuccess;
-//  return ncclSharpRegMr(collComm, data, (size_t)size, type, mhandle);
+  return ncclSharpRegMr(collComm, data, (size_t)size, type, mhandle);
 }
 
 ncclResult_t ncclSharpDeregMr(void* collComm, void* mhandle) {
-#if 0
   struct ncclSharpCollComm* cComm = (struct ncclSharpCollComm*)collComm;
   struct ncclSharpMemHandle *mh = (struct ncclSharpMemHandle *)mhandle;
 
@@ -1285,11 +554,6 @@ ncclResult_t ncclSharpDeregMr(void* collComm, void* mhandle) {
   NCCLCHECK(ncclNetPlugin_v7.deregMr(cComm->recvComm, mh->ncclIbMr));
 
   free(mh);
-#endif
-  #ifdef HAVE_UROM
-    mapped_mem_t *map = (mapped_mem_t *)mhandle;
-    ucp_mem_unmap(urom_info.ucp_ctx, map->memh);
-  #endif
   /* UCC does not have this feature yet */
   return ncclSuccess;
 }
@@ -1370,86 +634,15 @@ ncclResult_t ncclSharpIallreduce(void* collComm, void* sendData, void* recvData,
   req->requestType = NCCL_SHARP_REQ_SHARP_COLL;
   *request = req;
 #endif
-#if 0
-    int rank;
-    urom_request_t *req = malloc(sizeof(urom_request_t));
-    urom_worker_notify_t *notif;
-    urom_status_t status;
-    int dt_size = typeSize(dataType);
-    reg_keys_t *keys = malloc(sizeof(reg_keys_t) + 1024);
-    
-    keys->xgvmi_flag = 0;
-    //FIXME: this would eventually be map_beg, not 0
-    for (int i = 0; i < map_end; i++) {
-        if (map_array[i].src <= sendData &&
-            (map_array[i].src + map_array[i].len) >= sendData) {
-            keys->src_len = map_array[i].key_len;
-            memcpy(keys->rkeys, map_array[i].key, keys->src_len);
-            break;
-        }
-    }
-#if 1
-    // error check?
-    for (int i = 0; i < map_end; i++) {
-        if (map_array[i].src <= recvData &&
-            (map_array[i].src + map_array[i].len) >= recvData) {
-            keys->dst_len = map_array[i].key_len;
-            memcpy(keys->rkeys + keys->src_len, map_array[i].key, keys->dst_len);
-            break;
-        }
-    }
-#endif
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    size_t size = count * dt_size;
-    ucc_coll_args_t coll_args_allreduce = {
-        .mask = UCC_COLL_ARGS_FIELD_GLOBAL_WORK_BUFFER | UCC_COLL_ARGS_FIELD_FLAGS,
-        .flags = UCC_COLL_ARGS_FLAG_MEM_MAPPED_BUFFERS,
-        .coll_type = UCC_COLL_TYPE_ALLREDUCE,
-        .src.info = {
-            .buffer = (void *)sendData,
-            .count = size,
-            .datatype = UCC_DT_FLOAT32, //change this
-            .mem_type = UCC_MEMORY_TYPE_UNKNOWN,
-        },
-        .dst.info = {
-            .buffer = (void *)(recvData),
-            .count = size,
-            .datatype = UCC_DT_FLOAT32,
-            .mem_type = UCC_MEMORY_TYPE_UNKNOWN,
-        },
-        .global_work_buffer = keys,
-    };
-    urom_worker_cmd_t coll_cmd = {
-        .cmd_type = UROM_WORKER_CMD_UCC,
-        .ucc.dpu_worker_id = rank,
-        .ucc.cmd_type = UROM_WORKER_CMD_UCC_COLL,
-        .ucc.coll_cmd.coll_args = &coll_args_allreduce,
-        .ucc.coll_cmd.team = urom_info.ucc_team,
-        .ucc.coll_cmd.use_xgvmi = 0,
-        .ucc.coll_cmd.work_buffer = coll_args_allreduce.global_work_buffer,
-        .ucc.coll_cmd.work_buffer_size = sizeof(reg_keys_t) + keys->src_len + keys->dst_len,
-    };
-#endif
   int rank;
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   int dt_size = typeSize(dataType);
   request_t *req = malloc(sizeof(request_t));
 
-#ifdef HAVE_UROM
-  urom_worker_cmd_t *cmd;
 
-  /* FIXME: use the appropriate datatype */
-  cmd = urom_coll_init(rank, sendData, recvData, dt_size * count, dt_size * count,
-                       UCC_DT_FLOAT32, UCC_COLL_TYPE_ALLREDUCE, 0);
-
-  urom_worker_push_cmdq(urom_info.worker, 0, cmd);
-#endif
-
-//#ifdef HAVE_UCC
   ucc_coll_req_h reqh;
   ucc_coll_init(rank, sendData, recvData, dt_size * count, dt_size * count, ucc_typeConvert(dataType), ucc_opConvert(redOp), UCC_COLL_TYPE_ALLREDUCE, &reqh);
   req->req_h = reqh;
-//#endif
   req->dst = recvData;
   req->len = dt_size * count;
   req->id = num_outstanding;
@@ -1507,23 +700,12 @@ ncclResult_t ncclSharpIallgather(void* collComm, void* sendData, int nRecvParts,
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   request_t *req = malloc(sizeof(request_t));
 
-#ifdef HAVE_UROM
-    // FIXME: size is wrong...
-  urom_worker_cmd_t *cmd;
-  cmd = urom_coll_init(rank, sendData, recvParts[0].address, bytesPerRank, recvParts[0].size,
-                       UCC_DT_INT8, UCC_COLL_TYPE_ALLGATHER, 0);
-
-  urom_worker_push_cmdq(urom_info.worker, 0, cmd);
-#endif
-
-#ifdef HAVE_UCC
   ucc_coll_req_h reqh;
   if (bytesPerRank == recvParts[0].size) {
     ucc_coll_init(rank, sendData, recvParts[0].address, bytesPerRank, recvParts[0].size,
                   UCC_DT_INT8, 0, UCC_COLL_TYPE_ALLGATHER, &reqh);
   }
   req->req_h = reqh;
-#endif
   req->dst = recvParts[0].address;
   req->len = bytesPerRank;
   req->id = num_outstanding;
@@ -1616,29 +798,6 @@ ncclResult_t ncclSharpIflush(void* collComm, void* data, int size, void* mhandle
    return ncclSuccess;
 }
 
-#ifdef HAVE_UROM
-ncclResult_t ncclUromTest(request_t *request, int *done) {
-  urom_worker_notify_t *notif;
-  urom_status_t status;
-
-  /* FIXME: add seq id to urom command / notification */
-  status = urom_worker_pop_notifyq(urom_info.worker, 0, &notif);
-  if (UROM_ERR_QUEUE_EMPTY == status) {
-      *done = 0;
-      return ncclSuccess;
-  }
-
-  *done = 1;
-  free(request->keys);
-  if (status < 0) {
-      printf("ERROR IN UROM\n");
-      return !ncclSuccess;
-  }
-  return ncclSuccess;
-}
-#endif
-
-#ifdef HAVE_UCC
 ncclResult_t ncclUccTest(request_t *request, int *done) {
   ucc_coll_req_h reqh = request->req_h;
   ucc_status_t status;
@@ -1657,28 +816,18 @@ ncclResult_t ncclUccTest(request_t *request, int *done) {
   free(request->keys);
   return ncclSuccess;
 }
-#endif
 
 ncclResult_t ncclSharpTest(void* request, int* done, int* size) {
-#if !defined(HAVE_UROM) && !defined(HAVE_UCC)
+#if 0 
   struct ncclSharpRequest* req = (struct ncclSharpRequest*)request;
   ncclNetPlugin_v7.test(req->sharpRequest, done, size);
   if (*done == 1) {
     req->used = 0;
   }
-#else
+#endif
   request_t *p = (request_t *)request;
 
-#ifdef HAVE_UROM
-  return ncclUromTest(p, done);
-#endif
-
-#ifdef HAVE_UCC
   return ncclUccTest(p, done);
-#endif
-
-#endif
-  return ncclSuccess;
 }
 
 ncclResult_t ncclSharpCloseColl(void* collComm) {
