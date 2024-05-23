@@ -30,6 +30,10 @@ struct ncclUCCListenComm {
     void *listenCommP2P;
 };
 
+struct ncclUCCMemHandle {
+  int type;
+};
+
 typedef struct reg_keys {
     uint64_t xgvmi_flag;
     size_t src_len;
@@ -260,7 +264,6 @@ ucc_status_t nccl_ucc_coll_init(struct ncclUCCCollComm * cComm,
   if (!coll_args) {
     return UCC_ERR_NO_MEMORY;
   }
-printf("coll type %d, dt %ld op %d scount %lu rcount %lu\n", coll_type, dt, op, scount, rcount);
   coll_args->mask = 0; 
   coll_args->coll_type = coll_type;
   coll_args->src.info.buffer = src;
@@ -279,7 +282,6 @@ printf("coll type %d, dt %ld op %d scount %lu rcount %lu\n", coll_type, dt, op, 
   /* find keys */
   useGWB = getenv("NCCL_UCC_USEGWB");
   if (useGWB != NULL) {
-    printf("using keys\n");
     keys = malloc(sizeof(reg_keys_t) + 1024); // FIXME: not 1024?
     if (!keys) {
       fprintf(stderr, "Out of memory\n");
@@ -311,6 +313,11 @@ printf("coll type %d, dt %ld op %d scount %lu rcount %lu\n", coll_type, dt, op, 
   ucc_status = ucc_collective_init(coll_args, &coll_req, cComm->ucc_team);
   if (ucc_status != UCC_OK) {
     fprintf(stderr, "Error in UCC\n");
+    return ucc_status;
+  }
+  ucc_status = ucc_collective_post(reqh);
+  if (ucc_status != UCC_OK) {
+    UCC_ERROR("error on post");
     return ucc_status;
   }
 
@@ -390,12 +397,11 @@ static ucc_status_t ncclUccTeamCreate(struct ncclUCCCollComm *cComm, size_t rank
 ncclResult_t ncclUCCInit(ncclDebugLogger_t logFunction) {
   num_outstanding = 0;
 
-    printf("i'm initing\n");
   return ncclNetPlugin_v7.init(logFunction);
 }
 
 ncclResult_t ncclUCCDevices(int* ndev) {
-  *ndev = 1;//ncclNUCCDevs;
+  *ndev = 1;
   return ncclSuccess;
 }
 
@@ -420,8 +426,6 @@ ncclResult_t ncclUCCListen(int dev, void* opaqueHandle, void** listenComm) {
   struct ncclUCCListenComm *lComm;
   ncclResult_t status;
 
-    printf("LISTENING\n");
-
   NCCLCHECK(ncclIbMalloc((void**)&lComm, sizeof(struct ncclUCCListenComm)));
   status = ncclNetPlugin_v7.listen(dev, opaqueHandle, &lComm->listenCommP2P);
   lComm->dev = dev;
@@ -434,19 +438,16 @@ ncclResult_t ncclUCCConnect(void* handles[], int nranks, int rank, void* listenC
   struct ncclUCCListenComm *lComm = (struct ncclUCCListenComm *)listenComm;
   struct ncclUCCCollComm *cComm;
 
-    printf("CONNECT!\n");
-
   /* let's create endpoints here */
   char *useUCC;
   useUCC = getenv("NCCL_UCC_ENABLE");
-  if (1 || useUCC != NULL) {
+  if (useUCC != NULL) {
     ucc_status_t status;
     size_t buffer_len;
     int next;
 
     NCCLCHECK(ncclIbMalloc((void *)&cComm, sizeof(struct ncclUCCCollComm)));
 
-    printf("INIT IS PERFRMED!\n");
     cComm->nranks = nranks;
     cComm->rank = rank;
     /* create a staging buffer. F: should we remove? */
@@ -487,13 +488,10 @@ ncclResult_t ncclUCCConnect(void* handles[], int nranks, int rank, void* listenC
 
     status = ncclUccTeamCreate(cComm, rank, nranks);
     if (status != UCC_OK) {
-        printf("team failed\n");
       // ctx destroy
       return !ncclSuccess;
     }
-  } else {
-    printf("no connect!\n");
-    }
+  }
 
   INFO(NCCL_INIT, "UCC rank %d / %d initialized\n", rank, nranks);
   *collComm = cComm;
@@ -506,59 +504,38 @@ ncclResult_t ncclUCCReduceSupport(ncclDataType_t dataType, ncclRedOp_t redOp, in
 }
 
 ncclResult_t ncclUCCRegMrDmaBuf(void* collComm, void* data, size_t size, int type, uint64_t offset, int fd, void** mhandle) {
-    printf("2 CALLED\n");
   return ncclSuccess;
 }
 
 ncclResult_t ncclUCCRegMr(void* collComm, void* data, size_t size, int type, void** mhandle) {
-    printf("CALLED\n");
-   return ncclSuccess;
+  struct ncclUCCMemHandle *mh;
+  NCCLCHECK(ncclIbMalloc((void **)&mh, sizeof(struct ncclUCCMemHandle)));
+  mh->type = type;
+  *mhandle = mh;
+  return ncclSuccess;
 }
 
 ncclResult_t ncclUCCRegMr_v7(void* collComm, void* data, int size, int type, void** mhandle) {
-    printf("again\n");
-    return ncclSuccess;
+  return ncclUCCRegMr(collComm, data, size, type, mhandle);
 }
 
 ncclResult_t ncclUCCDeregMr(void* collComm, void* mhandle) {
-  /* UCC does not have this feature yet */
-    printf("again\n");
+  free(mhandle);
   return ncclSuccess;
 }
 
 ncclResult_t ncclUCCGetRequest(struct ncclUCCRequest* reqs, struct ncclUCCRequest** req) {
-    printf("again\n");
-    return ncclSuccess;
+  return ncclSuccess;
 }
 
 ncclResult_t ncclUCCIallreduce(void* collComm, void* sendData, void* recvData, int count,
       ncclDataType_t dataType, ncclRedOp_t redOp, void* sendMhandle, void* recvMhandle, void** request) {
   struct ncclUCCCollComm *cComm = (struct ncclUCCCollComm *)collComm;
-  //int rank = cComm->rank;
   int dt_size = typeSize(dataType);
   request_t *req = malloc(sizeof(request_t));
 
-  ucc_coll_req_h reqh;
-    printf("dt_size: %d\n", dt_size);
-    ucc_coll_args_t coll_args = {
-        .mask = 0,
-        .coll_type = UCC_COLL_TYPE_ALLREDUCE,
-        .src.info = {
-            .buffer = sendData,
-            .count = count,
-            .datatype = ucc_typeConvert(dataType),
-            .mem_type = UCC_MEMORY_TYPE_UNKNOWN,
-        },
-        .dst.info = {
-            .buffer = recvData,
-            .count = count,
-            .datatype = ucc_typeConvert(dataType),
-            .mem_type = UCC_MEMORY_TYPE_UNKNOWN,
-        },
-        .op = ucc_opConvert(redOp),
-    };
-//  nccl_ucc_coll_init(cComm, rank, sendData, recvData, dt_size * count, dt_size * count, ucc_typeConvert(dataType), ucc_opConvert(redOp), UCC_COLL_TYPE_ALLREDUCE, &reqh);
-    ucc_collective_init(&coll_args, &reqh, cComm->ucc_team);
+  nccl_ucc_coll_init(cComm, rank, sendData, recvData, count, count, ucc_typeConvert(dataType), ucc_opConvert(redOp), UCC_COLL_TYPE_ALLREDUCE, &reqh);
+//  ucc_collective_post(reqh);
   req->req_h = reqh;
   req->dst = recvData;
   req->len = dt_size * count;
@@ -647,6 +624,7 @@ ncclResult_t ncclUCCTest(void* request, int* done, int* size) {
   }
 
   *done = 1;
+  ucc_collective_finalize(reqh);
 //  free(req->keys);
   return ncclSuccess;
 }
@@ -666,8 +644,6 @@ ncclResult_t ncclUCCCloseColl(void* collComm) {
 ncclResult_t ncclUCCCloseListen(void* listenComm) {
   struct ncclUCCListenComm *lComm = (struct ncclUCCListenComm*)listenComm;
   ncclResult_t status;
-
-    printf("LISTENING\n");
 
   status = ncclNetPlugin_v7.closeListen(lComm->listenCommP2P);
   free(listenComm);
