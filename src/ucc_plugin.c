@@ -30,10 +30,6 @@ struct ncclUCCListenComm {
     void *listenCommP2P;
 };
 
-struct ncclUCCMemHandle {
-  int type;
-};
-
 typedef struct reg_keys {
     uint64_t xgvmi_flag;
     size_t src_len;
@@ -246,18 +242,25 @@ static __inline__ ucc_reduction_op_t opConvert(ncclRedOp_t op) {
   }
 }
 
+typedef struct coll_params {
+    void *src;
+    void *dst;
+    ucc_memory_type_t src_type;
+    ucc_memory_type_t dst_type;
+    size_t scount;
+    size_t rcount;
+    ucc_datatype_t dt;
+    ucc_reduction_op_t op;
+    ucc_coll_type_t coll_type;
+} coll_params_t;
+
 /* UCC addition */
 ucc_status_t nccl_ucc_coll_init(struct ncclUCCCollComm * cComm, 
-                           int rank, void *src, void *dst,
-                           size_t scount, size_t rcount, ucc_datatype_t dt,
-                           ucc_reduction_op_t op, 
-                           ucc_coll_type_t coll_type, ucc_coll_req_h *req)
+                           coll_params_t *coll_params, ucc_coll_req_h *req)
 {
-  reg_keys_t *keys;
   ucc_coll_args_t *coll_args;
   ucc_coll_req_h   coll_req;
   ucc_status_t     ucc_status;
-  char *useGWB;
 
   /* setup coll args */
   coll_args = (ucc_coll_args_t *)malloc(sizeof(ucc_coll_args_t));
@@ -265,49 +268,18 @@ ucc_status_t nccl_ucc_coll_init(struct ncclUCCCollComm * cComm,
     return UCC_ERR_NO_MEMORY;
   }
   coll_args->mask = 0; 
-  coll_args->coll_type = coll_type;
-  coll_args->src.info.buffer = src;
-  coll_args->src.info.count = scount;
-  coll_args->src.info.datatype = dt;
-  coll_args->src.info.mem_type = UCC_MEMORY_TYPE_UNKNOWN;
-  coll_args->dst.info.buffer = dst;
-  coll_args->dst.info.count = rcount;
-  coll_args->dst.info.datatype = dt;
-  coll_args->dst.info.mem_type = UCC_MEMORY_TYPE_UNKNOWN;
+  coll_args->coll_type = coll_params->coll_type;
+  coll_args->src.info.buffer = coll_params->src;
+  coll_args->src.info.count = coll_params->scount;
+  coll_args->src.info.datatype = coll_params->dt;
+  coll_args->src.info.mem_type = coll_params->src_type;
+  coll_args->dst.info.buffer = coll_params->dst;
+  coll_args->dst.info.count = coll_params->rcount;
+  coll_args->dst.info.datatype = coll_params->dt;
+  coll_args->dst.info.mem_type = coll_params->dst_type;
 
-  if (coll_type == UCC_COLL_TYPE_ALLREDUCE) {
-    coll_args->op = op;
-  }
-
-  /* find keys */
-  useGWB = getenv("NCCL_UCC_USEGWB");
-  if (useGWB != NULL) {
-    keys = malloc(sizeof(reg_keys_t) + 1024); // FIXME: not 1024?
-    if (!keys) {
-      fprintf(stderr, "Out of memory\n");
-      return UCC_ERR_NO_MEMORY;
-    }
-
-    for (int i = 0; i < map_end; i++) {
-      if (map_array[i].src <= src &&
-        (map_array[i].src + map_array[i].len) >= src) {
-          keys->src_len = map_array[i].key_len;
-          memcpy(keys->rkeys, map_array[i].key, keys->src_len);
-          break;
-      }
-    }
-    // error check?
-    for (int i = 0; i < map_end; i++) {
-      if (map_array[i].src <= dst &&
-        (map_array[i].src + map_array[i].len) >= dst) {
-        keys->dst_len = map_array[i].key_len;
-        memcpy(keys->rkeys + keys->src_len, map_array[i].key, keys->dst_len);
-        break;
-      }
-    }
-
-    coll_args->mask |= UCC_COLL_ARGS_FIELD_GLOBAL_WORK_BUFFER;
-    coll_args->global_work_buffer = keys;
+  if (coll_params->coll_type == UCC_COLL_TYPE_ALLREDUCE) {
+    coll_args->op = coll_params->op;
   }
 
   ucc_status = ucc_collective_init(coll_args, &coll_req, cComm->ucc_team);
@@ -315,7 +287,7 @@ ucc_status_t nccl_ucc_coll_init(struct ncclUCCCollComm * cComm,
     fprintf(stderr, "Error in UCC\n");
     return ucc_status;
   }
-  ucc_status = ucc_collective_post(reqh);
+  ucc_status = ucc_collective_post(coll_req);
   if (ucc_status != UCC_OK) {
     UCC_ERROR("error on post");
     return ucc_status;
@@ -531,16 +503,37 @@ ncclResult_t ncclUCCGetRequest(struct ncclUCCRequest* reqs, struct ncclUCCReques
 ncclResult_t ncclUCCIallreduce(void* collComm, void* sendData, void* recvData, int count,
       ncclDataType_t dataType, ncclRedOp_t redOp, void* sendMhandle, void* recvMhandle, void** request) {
   struct ncclUCCCollComm *cComm = (struct ncclUCCCollComm *)collComm;
-  int dt_size = typeSize(dataType);
+
+  struct ncclUCCMemHandle *mr_src = (struct ncclUCCMemHandle *)sendMhandle;
+  struct ncclUCCMemHandle *mr_dst = (struct ncclUCCMemHandle *)recvMhandle;
+  ucc_memory_type_t src_type = (mr_src->type == NCCL_PTR_CUDA) ? UCC_MEMORY_TYPE_CUDA : UCC_MEMORY_TYPE_HOST;
+  ucc_memory_type_t dst_type = (mr_dst->type == NCCL_PTR_CUDA) ? UCC_MEMORY_TYPE_CUDA : UCC_MEMORY_TYPE_HOST;
+  ucc_coll_req_h reqh;
+  ucc_coll_args_t coll_args = {
+    .mask = 0,
+    .coll_type = UCC_COLL_TYPE_ALLREDUCE,
+    .src.info = {
+        .buffer = sendData,
+        .count = count,
+        .datatype = ucc_typeConvert(dataType),
+        .mem_type = src_type,
+    },
+    .dst.info = {
+        .buffer = recvData,
+        .count = count,
+        .datatype = ucc_typeConvert(dataType),
+        .mem_type = dst_type,
+    },
+    .op = ucc_opConvert(redOp),
+  };
   request_t *req = malloc(sizeof(request_t));
 
-  nccl_ucc_coll_init(cComm, rank, sendData, recvData, count, count, ucc_typeConvert(dataType), ucc_opConvert(redOp), UCC_COLL_TYPE_ALLREDUCE, &reqh);
-//  ucc_collective_post(reqh);
+  ucc_collective_init(&coll_args, &reqh, cComm->ucc_team);
+  ucc_collective_post(reqh);
   req->req_h = reqh;
   req->dst = recvData;
-  req->len = dt_size * count;
+  req->len = typeSize(dataType) * count;
   req->id = num_outstanding;
-//  req->keys = keys;
   *request = req;
   return ncclSuccess;
 }
@@ -550,21 +543,37 @@ ncclResult_t ncclUCCIallgather(void* collComm, void* sendData, int nRecvParts, n
                              void* sendMhandle, void** request)
 {
   struct ncclUCCCollComm *cComm = (struct ncclUCCCollComm *)collComm;
-  int rank = cComm->rank;
+  struct ncclUCCMemHandle *mr_src = (struct ncclUCCMemHandle *)sendMhandle;
+  struct ncclUCCMemHandle *mr_dst = (struct ncclUCCMemHandle *)recvParts[0].mhandle;
+  ucc_memory_type_t src_type = (mr_src->type == NCCL_PTR_CUDA) ? UCC_MEMORY_TYPE_CUDA : UCC_MEMORY_TYPE_HOST;
+  ucc_memory_type_t dst_type = (mr_dst->type == NCCL_PTR_CUDA) ? UCC_MEMORY_TYPE_CUDA : UCC_MEMORY_TYPE_HOST;
   request_t *req = malloc(sizeof(request_t));
-
   ucc_coll_req_h reqh;
   if (bytesPerRank == recvParts[0].size) {
-    nccl_ucc_coll_init(cComm, rank, sendData, recvParts[0].address, bytesPerRank, recvParts[0].size,
-                  UCC_DT_INT8, 0, UCC_COLL_TYPE_ALLGATHER, &reqh);
+    ucc_coll_args_t coll_args = {
+        .mask = 0,
+        .coll_type = UCC_COLL_TYPE_ALLGATHER,
+        .src.info = {
+            .buffer = sendData,
+            .count = bytesPerRank,
+            .datatype = UCC_DT_INT8,
+            .mem_type = src_type,
+        },
+        .dst.info = {
+            .buffer = recvParts[0].address,
+            .count = recvParts[0].size,
+            .datatype = UCC_DT_INT8,
+            .mem_type = dst_type,
+        },
+    };
+    ucc_collective_init(&coll_args, &reqh, cComm->ucc_team);
+    ucc_collective_post(reqh);
   }
   req->req_h = reqh;
   req->dst = recvParts[0].address;
   req->len = bytesPerRank;
   req->id = num_outstanding;
-//  req->keys = keys;
   *request = req;
-
   return ncclSuccess;
 }
 
@@ -588,13 +597,36 @@ ncclResult_t ncclUCCIreducescatter(void* collComm, int nSendParts, ncclNetSGE_v8
   }
 
   assert(nSendParts == 1);
+  struct ncclUCCMemHandle *mr_src = (struct ncclUCCMemHandle *)sendParts[0].mhandle;
+  struct ncclUCCMemHandle *mr_dst = (struct ncclUCCMemHandle *)recvMhandle;
+  ucc_memory_type_t src_type = (mr_src->type == NCCL_PTR_CUDA) ? UCC_MEMORY_TYPE_CUDA : UCC_MEMORY_TYPE_HOST;
+  ucc_memory_type_t dst_type = (mr_dst->type == NCCL_PTR_CUDA) ? UCC_MEMORY_TYPE_CUDA : UCC_MEMORY_TYPE_HOST;
 
   int dt_size = typeSize(dataType);
   request_t *req = malloc(sizeof(request_t));
+  ucc_coll_args_t coll_args = {
+    .mask = 0,
+    .coll_type = UCC_COLL_TYPE_REDUCE_SCATTER,
+    .src.info = {
+        .buffer = sendParts[0].address,
+        .count = sendParts[0].size,
+        .datatype = ucc_typeConvert(dataType),
+        .mem_type = src_type,
+    },
+    .dst.info = {
+        .buffer = recvData,
+        .count = bytesPerRank,
+        .datatype = ucc_typeConvert(dataType),
+        .mem_type = dst_type,
+    },
+    .op = ucc_opConvert(redOp),
+  };
+
 
   /* FIXME */
   ucc_coll_req_h reqh;
-  nccl_ucc_coll_init(cComm, cComm->rank, sendParts[0].mhandle, recvData, dt_size, dt_size, ucc_typeConvert(dataType), ucc_opConvert(redOp), UCC_COLL_TYPE_REDUCE_SCATTER, &reqh);
+  ucc_collective_init(&coll_args, &reqh, cComm->ucc_team);
+  ucc_collective_post(reqh);
   req->req_h = reqh;
   req->dst = recvData;
   req->len = dt_size;
@@ -619,13 +651,11 @@ ncclResult_t ncclUCCTest(void* request, int* done, int* size) {
     return ncclSuccess;
   } else if (status < 0) {
     UCC_ERROR("error in test");
-    //free(req->keys);
     return !ncclSuccess;
   }
 
   *done = 1;
   ucc_collective_finalize(reqh);
-//  free(req->keys);
   return ncclSuccess;
 }
 
