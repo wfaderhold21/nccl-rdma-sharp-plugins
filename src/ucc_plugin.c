@@ -30,21 +30,6 @@ struct ncclUCCListenComm {
     void *listenCommP2P;
 };
 
-typedef struct reg_keys {
-    uint64_t xgvmi_flag;
-    size_t src_len;
-    size_t dst_len;
-    char rkeys[];
-} reg_keys_t;
-
-typedef struct mapped_mem {
-    ucp_mem_h memh;
-    void *src;
-    size_t len;
-    size_t key_len;
-    void *key;
-} mapped_mem_t;
-
 typedef struct ncclUCCRequest {
     uint64_t id;
     void *dst;
@@ -64,13 +49,10 @@ struct ncclUCCCollComm {
   int    nranks;
   void*  recvComm;
   void*  sendComm;
-//  struct ncclUCCRequest*   reqs;
   ucc_lib_h       ucc_lib;
   ucc_context_h   ucc_ctx;
   ucc_team_h      ucc_team;
 };
-
-//struct ncclUccInfo ucc_info;
 
 static __inline__ ucc_datatype_t ucc_typeConvert(ncclDataType_t type) {
   switch (type) {
@@ -116,7 +98,6 @@ static __inline__ ucc_reduction_op_t ucc_opConvert(ncclRedOp_t op) {
 
 int ncclUCCAllGather(void *context, void *src_buf, void *recv_buf, int len) {
   struct ncclUCCCollComm *cComm = (struct ncclUCCCollComm *)context;
-//  struct ncclUCCCollComm* cComm = (struct ncclUCCCollComm*)context;
 
   nccl_p2p_plugin_t p2p_plugin;
   void *rMhandle = NULL, *sMhandle = NULL;
@@ -180,12 +161,6 @@ ucc_status_t UCC_oob_allgather(void *src_buf, void *recv_buf, size_t size,
 ucc_status_t UCC_oob_req_test(void *request) { return UCC_OK; }
 ucc_status_t UCC_oob_req_free(void *request) { return UCC_OK; }
 
-size_t            staging_buffer_len = 0;
-void             *staging_buffer;
-
-
-#define STAGING_BUF_LEN  536870912
-
 #define ncclBfloat16 9
 
 static __inline__ ucc_datatype_t typeConvert(ncclDataType_t type) {
@@ -240,61 +215,6 @@ static __inline__ ucc_reduction_op_t opConvert(ncclRedOp_t op) {
     case ncclAvg:  return UCC_OP_AVG;
     default:       return -1;
   }
-}
-
-typedef struct coll_params {
-    void *src;
-    void *dst;
-    ucc_memory_type_t src_type;
-    ucc_memory_type_t dst_type;
-    size_t scount;
-    size_t rcount;
-    ucc_datatype_t dt;
-    ucc_reduction_op_t op;
-    ucc_coll_type_t coll_type;
-} coll_params_t;
-
-/* UCC addition */
-ucc_status_t nccl_ucc_coll_init(struct ncclUCCCollComm * cComm, 
-                           coll_params_t *coll_params, ucc_coll_req_h *req)
-{
-  ucc_coll_args_t *coll_args;
-  ucc_coll_req_h   coll_req;
-  ucc_status_t     ucc_status;
-
-  /* setup coll args */
-  coll_args = (ucc_coll_args_t *)malloc(sizeof(ucc_coll_args_t));
-  if (!coll_args) {
-    return UCC_ERR_NO_MEMORY;
-  }
-  coll_args->mask = 0; 
-  coll_args->coll_type = coll_params->coll_type;
-  coll_args->src.info.buffer = coll_params->src;
-  coll_args->src.info.count = coll_params->scount;
-  coll_args->src.info.datatype = coll_params->dt;
-  coll_args->src.info.mem_type = coll_params->src_type;
-  coll_args->dst.info.buffer = coll_params->dst;
-  coll_args->dst.info.count = coll_params->rcount;
-  coll_args->dst.info.datatype = coll_params->dt;
-  coll_args->dst.info.mem_type = coll_params->dst_type;
-
-  if (coll_params->coll_type == UCC_COLL_TYPE_ALLREDUCE) {
-    coll_args->op = coll_params->op;
-  }
-
-  ucc_status = ucc_collective_init(coll_args, &coll_req, cComm->ucc_team);
-  if (ucc_status != UCC_OK) {
-    fprintf(stderr, "Error in UCC\n");
-    return ucc_status;
-  }
-  ucc_status = ucc_collective_post(coll_req);
-  if (ucc_status != UCC_OK) {
-    UCC_ERROR("error on post");
-    return ucc_status;
-  }
-
-  *req = coll_req;
-  return UCC_OK;
 }
 
 static ucc_status_t ncclUccCtxCreate(struct ncclUCCCollComm *cComm, void *buf, size_t len)
@@ -621,10 +541,8 @@ ncclResult_t ncclUCCIreducescatter(void* collComm, int nSendParts, ncclNetSGE_v8
     },
     .op = ucc_opConvert(redOp),
   };
-
-
-  /* FIXME */
   ucc_coll_req_h reqh;
+
   ucc_collective_init(&coll_args, &reqh, cComm->ucc_team);
   ucc_collective_post(reqh);
   req->req_h = reqh;
