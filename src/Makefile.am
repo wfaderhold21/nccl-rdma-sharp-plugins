@@ -34,12 +34,6 @@ libnccl_net_la_LDFLAGS  += $(SHARP_LDFLAGS)
 libnccl_net_la_SOURCES  += sharp_plugin.c
 endif
 
-if HAVE_UROM
-libnccl_net_la_CPPFLAGS += -DHAVE_UROM $(UROM_CPPFLAGS)
-libnccl_net_la_LIBADD   += $(UROM_LIBADD)
-libnccl_net_la_LDFLAGS  += $(UROM_LDFLAGS)
-endif
-
 if HAVE_UCC
 libnccl_net_la_CPPFLAGS += -DHAVE_UCC_PLUGIN $(UCC_CPPFLAGS) $(UCX_CPPFLAGS)
 libnccl_net_la_LIBADD   += $(UCC_LIBADD)
