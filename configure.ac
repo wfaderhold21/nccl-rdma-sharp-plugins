@@ -95,12 +95,6 @@ m4_include([m4/sharp.m4])
 CHECK_SHARP
 AC_MSG_RESULT([SHARP support: $sharp_happy])
 
-# check for urom
-AM_CONDITIONAL([HAVE_UROM], [false])
-m4_include([m4/urom.m4])
-CHECK_UROM
-AC_MSG_RESULT([UROM support: $urom_happy])
-
 AM_CONDITIONAL([HAVE_UCC], [false])
 m4_include([m4/ucc.m4])
 CHECK_UCC
