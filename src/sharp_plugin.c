@@ -19,7 +19,6 @@
 #include "sharp/api/version.h"
 #include "sharp/api/sharp_coll.h"
 #include "utils.h"
-#include "nccl.h"
 
 extern ncclNet_v8_t ncclNetPlugin_v8;
 extern ncclNet_v7_t ncclNetPlugin_v7;
@@ -42,7 +41,6 @@ struct ncclSharpRequest {
   void *sharpRequest;
   int  size;
   int  used;
-  void *dest;
 };
 
 struct ncclSharpListenComm {
@@ -70,129 +68,6 @@ struct ncclSharpInfo {
   uint64_t hostId;
   uint64_t jobId;
 };
-
-static __inline__ ucc_datatype_t ucc_typeConvert(ncclDataType_t type) {
-  switch (type) {
-  case ncclInt8:
-    return UCC_DT_INT8;
-  case ncclUint8:
-    return UCC_DT_UINT8;
-  case ncclInt32:
-    return UCC_DT_INT32;
-  case ncclUint32:
-    return UCC_DT_UINT32;
-  case ncclInt64:
-    return UCC_DT_INT64;
-  case ncclUint64:
-    return UCC_DT_UINT64;
-  case ncclFloat16:
-    return UCC_DT_FLOAT16;
-  case ncclFloat32:
-    return UCC_DT_FLOAT32;
-  case ncclFloat64:
-    return UCC_DT_FLOAT64;
-  default:
-    return -1;
-  }
-}
-
-static __inline__ ucc_reduction_op_t ucc_opConvert(ncclRedOp_t op) {
-  switch (op) {
-  case ncclSum:
-    return UCC_OP_SUM;
-  case ncclProd:
-    return UCC_OP_PROD;
-  case ncclMax:
-    return UCC_OP_MAX;
-  case ncclMin:
-    return UCC_OP_MIN;
-  case ncclAvg:
-    return UCC_OP_AVG;
-  default:
-    return -1;
-  }
-}
-
-int ncclUCCAllGather(void *context, void *src_buf, void *recv_buf, int len) {
-//  struct ncclUCCCollComm *cComm = (struct ncclUCCCollComm *)context;
-  struct ncclSharpCollComm* cComm = (struct ncclSharpCollComm*)context;
-
-  nccl_p2p_plugin_t p2p_plugin;
-  void *rMhandle = NULL, *sMhandle = NULL;
-
-  assert(cComm->recvComm != NULL);
-  assert(cComm->sendComm != NULL);
-
-  p2p_plugin = nccl_p2p_get_plugin_type();
-  if (p2p_plugin != NCCL_P2P_UCX) {
-    NCCLCHECK(ncclNetPlugin_v7.regMr(cComm->recvComm, recv_buf,
-                                       cComm->nranks * len, NCCL_PTR_HOST,
-                                       &rMhandle));
-    NCCLCHECK(ncclNetPlugin_v7.regMr(cComm->sendComm, recv_buf,
-                                       cComm->nranks * len, NCCL_PTR_HOST,
-                                       &sMhandle));
-  }
-
-  int speer = cComm->rank;
-  memcpy(recv_buf + speer * len, src_buf, len);
-  for (int i = 0; i < cComm->nranks - 1; i++) {
-    void *srequest = NULL, *rrequest = NULL;
-    int rpeer = (speer - 1 + cComm->nranks) % cComm->nranks;
-    while (srequest == NULL || rrequest == NULL) {
-      void *rbuf = ((char *)recv_buf) + rpeer * len;
-      int tag = 0x69;
-      if (srequest == NULL)
-        NCCLCHECK(ncclNetPlugin_v7.isend(cComm->sendComm,
-                                           ((char *)recv_buf) + speer * len,
-                                           len, tag, sMhandle, &srequest));
-      if (rrequest == NULL)
-        NCCLCHECK(ncclNetPlugin_v7.irecv(cComm->recvComm, 1, &rbuf, &len,
-                                           &tag, &rMhandle, &rrequest));
-    }
-    while (srequest || rrequest) {
-      int done;
-      if (rrequest)
-        NCCLCHECK(ncclNetPlugin_v7.test(rrequest, &done, NULL));
-      if (done)
-        rrequest = NULL;
-      if (srequest)
-        NCCLCHECK(ncclNetPlugin_v7.test(srequest, &done, NULL));
-      if (done)
-        srequest = NULL;
-    }
-    speer = rpeer;
-  }
-  if (p2p_plugin != NCCL_P2P_UCX) {
-    NCCLCHECK(ncclNetPlugin_v7.deregMr(cComm->recvComm, rMhandle));
-    NCCLCHECK(ncclNetPlugin_v7.deregMr(cComm->sendComm, sMhandle));
-  }
-
-  return 0;
-}
-
-ucc_status_t UCC_oob_allgather(void *src_buf, void *recv_buf, size_t size,
-                               void *coll_info, void **request) {
-  NCCLCHECK(ncclUCCAllGather(coll_info, src_buf, recv_buf, (int)size))
-  return UCC_OK;
-}
-
-ucc_status_t UCC_oob_req_test(void *request) { return UCC_OK; }
-ucc_status_t UCC_oob_req_free(void *request) { return UCC_OK; }
-
-size_t            staging_buffer_len = 0;
-void             *staging_buffer;
-
-typedef struct request {
-    uint64_t id;
-    void *dst;
-    size_t len;
-    void *keys;
-    void *req_h;
-} request_t;
-
-#define STAGING_BUF_LEN  536870912
-
-#define ncclBfloat16 9
 
 static __inline__ enum sharp_datatype typeConvert(ncclDataType_t type) {
   switch (type) {
@@ -317,7 +192,7 @@ int ncclSharpOobBcast(void *ctx, void *buf, int size, int root) {
   free(tmp);
   return 0;
 }
-    
+
 ncclResult_t ncclSharpInit(ncclDebugLogger_t logFunction) {
   struct timeval tval;
   gettimeofday(&tval, NULL);
@@ -328,6 +203,7 @@ ncclResult_t ncclSharpInit(ncclDebugLogger_t logFunction) {
   setenv("SHARP_COLL_NUM_COLL_GROUP_RESOURCE_ALLOC_THRESHOLD", "0", 0);
   setenv("SHARP_COLL_LOCK_ON_COMM_INIT", "1", 0);
   setenv("SHARP_COLL_LOG_LEVEL", "3", 0);
+
   return ncclNetPlugin_v7.init(logFunction);
 }
 
@@ -352,7 +228,6 @@ ncclResult_t ncclSharpGetProperties_v5(int dev, ncclNetProperties_v5_t* props) {
   return ncclNetPlugin_v5.getProperties(dev, props);
 }
 
-/* FERROL: nothing needs to be done here */
 ncclResult_t ncclSharpListen(int dev, void* opaqueHandle, void** listenComm) {
   struct ncclSharpListenComm *lComm;
   ncclResult_t status;
@@ -364,13 +239,11 @@ ncclResult_t ncclSharpListen(int dev, void* opaqueHandle, void** listenComm) {
   return status;
 }
 
-
-
 ncclResult_t ncclSharpConnect(void* handles[], int nranks, int rank, void* listenComm, void** collComm) {
   struct ncclSharpListenComm* lComm = (struct ncclSharpListenComm*)listenComm;
   struct ncclSharpCollComm* cComm;
-
   char *useSharp;
+
   if(nranks < ncclParamSharpGroupSizeThresh()) {
     INFO(NCCL_INIT|NCCL_NET|NCCL_ENV, "SHARP: Group size:%d is less than threshold:%d. fallback to non-sharp",
          nranks, ncclParamSharpGroupSizeThresh());
@@ -442,6 +315,7 @@ ncclResult_t ncclSharpConnect(void* handles[], int nranks, int rank, void* liste
   ncclSharpGetProperties_v6(lComm->dev, &prop);
   snprintf(devName, MAXNAMESIZE, "%s:%d", prop.name, prop.port);
   init_spec.config.ib_dev_list = devName;
+
   int ret = sharp_coll_init(&init_spec, &cComm->sharpCollContext);
 
 
@@ -481,8 +355,8 @@ ncclResult_t ncclSharpConnect(void* handles[], int nranks, int rank, void* liste
     sharp_coll_finalize(cComm->sharpCollContext);
     return ncclInternalError;
   }
-  *collComm = cComm;
 
+  *collComm = cComm;
   return ncclSuccess;
 }
 
@@ -514,7 +388,6 @@ ncclResult_t ncclSharpRegMrDmaBuf(void* collComm, void* data, size_t size, int t
   *mhandle = mh;
   return ncclSuccess;
 #else
-    printf("ERROR!\n");
   return ncclInternalError;
 #endif
 }
@@ -538,7 +411,6 @@ ncclResult_t ncclSharpRegMr(void* collComm, void* data, size_t size, int type, v
    return ncclSuccess;
 }
 
-
 ncclResult_t ncclSharpRegMr_v7(void* collComm, void* data, int size, int type, void** mhandle) {
   return ncclSharpRegMr(collComm, data, (size_t)size, type, mhandle);
 }
@@ -554,12 +426,11 @@ ncclResult_t ncclSharpDeregMr(void* collComm, void* mhandle) {
   NCCLCHECK(ncclNetPlugin_v7.deregMr(cComm->recvComm, mh->ncclIbMr));
 
   free(mh);
-  /* UCC does not have this feature yet */
   return ncclSuccess;
 }
 
 ncclResult_t ncclSharpGetRequest(struct ncclSharpRequest* reqs, struct ncclSharpRequest** req) {
-/*  for (int i=0; i<MAX_REQUESTS; i++) {
+  for (int i=0; i<MAX_REQUESTS; i++) {
     struct ncclSharpRequest* r = reqs+i;
     if (r->used == 0) {
       r->used = 1;
@@ -571,14 +442,11 @@ ncclResult_t ncclSharpGetRequest(struct ncclSharpRequest* reqs, struct ncclSharp
   }
   WARN("SHARP : unable to allocate request");
   *req = NULL;
-  return ncclInternalError;*/
-    return ncclSuccess;
+  return ncclInternalError;
 }
-
 
 ncclResult_t ncclSharpIallreduce(void* collComm, void* sendData, void* recvData, int count,
       ncclDataType_t dataType, ncclRedOp_t redOp, void* sendMhandle, void* recvMhandle, void** request) {
-#if 0
   struct ncclSharpCollComm* cComm = (struct ncclSharpCollComm*)collComm;
 
   enum sharp_datatype sharp_type = typeConvert(dataType);
@@ -633,21 +501,6 @@ ncclResult_t ncclSharpIallreduce(void* collComm, void* sendData, void* recvData,
 #endif
   req->requestType = NCCL_SHARP_REQ_SHARP_COLL;
   *request = req;
-#endif
-  int rank;
-  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-  int dt_size = typeSize(dataType);
-  request_t *req = malloc(sizeof(request_t));
-
-
-  ucc_coll_req_h reqh;
-  ucc_coll_init(rank, sendData, recvData, dt_size * count, dt_size * count, ucc_typeConvert(dataType), ucc_opConvert(redOp), UCC_COLL_TYPE_ALLREDUCE, &reqh);
-  req->req_h = reqh;
-  req->dst = recvData;
-  req->len = dt_size * count;
-  req->id = num_outstanding;
-//  req->keys = keys;
-  *request = req;
   return ncclSuccess;
 }
 
@@ -655,7 +508,6 @@ ncclResult_t ncclSharpIallgather(void* collComm, void* sendData, int nRecvParts,
                              size_t bytesPerRank, size_t windowOffset, size_t windowBytes,
                              void* sendMhandle, void** request)
 {
-#if 0
   struct ncclSharpCollComm* cComm = (struct ncclSharpCollComm*)collComm;
   struct ncclSharpMemHandle *send_mh = (struct ncclSharpMemHandle*)sendMhandle;
   struct ncclSharpMemHandle *recv_mh = (struct ncclSharpMemHandle*)recvParts[0].mhandle;
@@ -695,23 +547,6 @@ ncclResult_t ncclSharpIallgather(void* collComm, void* sendData, int nRecvParts,
 #endif
   req->requestType = NCCL_SHARP_REQ_SHARP_COLL;
   *request = req;
-#endif
-  int rank;
-  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-  request_t *req = malloc(sizeof(request_t));
-
-  ucc_coll_req_h reqh;
-  if (bytesPerRank == recvParts[0].size) {
-    ucc_coll_init(rank, sendData, recvParts[0].address, bytesPerRank, recvParts[0].size,
-                  UCC_DT_INT8, 0, UCC_COLL_TYPE_ALLGATHER, &reqh);
-  }
-  req->req_h = reqh;
-  req->dst = recvParts[0].address;
-  req->len = bytesPerRank;
-  req->id = num_outstanding;
-//  req->keys = keys;
-  *request = req;
-
   return ncclSuccess;
 }
 
@@ -758,7 +593,7 @@ ncclResult_t ncclSharpIreducescatter(void* collComm, int nSendParts, ncclNetSGE_
   reduce_spec.rbuf_desc.mem_type = (mr_rbuf->type == NCCL_PTR_CUDA ? SHARP_MEM_TYPE_CUDA:SHARP_MEM_TYPE_HOST);
 
   reduce_spec.length = sendParts[0].size / dt_size;
-  //reduce_spec.offset = windowOffset;
+  reduce_spec.offset = windowOffset;
   reduce_spec.dtype = sharp_type;
   reduce_spec.op = op_type;
   reduce_spec.aggr_mode = SHARP_AGGREGATION_NONE;
@@ -798,48 +633,47 @@ ncclResult_t ncclSharpIflush(void* collComm, void* data, int size, void* mhandle
    return ncclSuccess;
 }
 
-ncclResult_t ncclUccTest(request_t *request, int *done) {
-  ucc_coll_req_h reqh = request->req_h;
-  ucc_status_t status;
+ncclResult_t ncclSharpTest(void* request, int* done, int* size) {
+  struct ncclSharpRequest* req = (struct ncclSharpRequest*)request;
 
-  status = ucc_collective_test(reqh);
-  if (status == UCC_INPROGRESS) {
-    *done = 0;
+  if (req->requestType == NCCL_SHARP_REQ_IFLUSH) {
+    ncclNetPlugin_v7.test(req->sharpRequest, done, size);
+    if (*done == 1) {
+      req->used = 0;
+    }
     return ncclSuccess;
-  } else if (status < 0) {
-    UCC_ERROR("error in test");
-    free(request->keys);
-    return !ncclSuccess;
   }
 
-  *done = 1;
-  free(request->keys);
+#if BLOCKING==0
+  *done = sharp_coll_req_test(req->sharpRequest);
+  if (*done){
+    sharp_coll_req_free(req->sharpRequest);
+    *size = req->size;
+    req->used = 0;
+  } else {
+    *done = 0;
+  }
+#else
+  if (req->size != -1) {
+    *done = 1;
+    *size = req->size;
+    req->used = 0;
+  } else {
+     *done = 0;
+  }
+#endif
   return ncclSuccess;
 }
 
-ncclResult_t ncclSharpTest(void* request, int* done, int* size) {
-#if 0 
-  struct ncclSharpRequest* req = (struct ncclSharpRequest*)request;
-  ncclNetPlugin_v7.test(req->sharpRequest, done, size);
-  if (*done == 1) {
-    req->used = 0;
-  }
-#endif
-  request_t *p = (request_t *)request;
-
-  return ncclUccTest(p, done);
-}
-
 ncclResult_t ncclSharpCloseColl(void* collComm) {
-/*
   struct ncclSharpCollComm* cComm = (struct ncclSharpCollComm*)collComm;
+
   sharp_coll_comm_destroy(cComm->sharpCollComm);
   sharp_coll_finalize(cComm->sharpCollContext);
 
   NCCLCHECK(ncclNetPlugin_v7.closeRecv(cComm->recvComm));
   NCCLCHECK(ncclNetPlugin_v7.closeSend(cComm->sendComm));
   free(cComm);
-*/
   return ncclSuccess;
 }
 
