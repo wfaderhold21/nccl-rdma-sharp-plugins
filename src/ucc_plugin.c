@@ -34,24 +34,17 @@ typedef struct ncclUCCRequest {
     uint64_t id;
     void *dst;
     size_t len;
-    void *keys;
     void *req_h;
 } request_t;
 
-size_t map_beg = 0;
-size_t map_end = 0;
-mapped_mem_t map_array[128];
-
-int num_outstanding = 0;
-
 struct ncclUCCCollComm {
-  int    rank;
-  int    nranks;
-  void*  recvComm;
-  void*  sendComm;
-  ucc_lib_h       ucc_lib;
-  ucc_context_h   ucc_ctx;
-  ucc_team_h      ucc_team;
+  int           rank;
+  int           nranks;
+  void*         recvComm;
+  void*         sendComm;
+  ucc_lib_h     ucc_lib;
+  ucc_context_h ucc_ctx;
+  ucc_team_h    ucc_team;
 };
 
 static __inline__ ucc_datatype_t ucc_typeConvert(ncclDataType_t type) {
@@ -163,57 +156,21 @@ ucc_status_t UCC_oob_req_free(void *request) { return UCC_OK; }
 
 #define ncclBfloat16 9
 
-static __inline__ ucc_datatype_t typeConvert(ncclDataType_t type) {
-  switch (type) {
-  case ncclInt8:
-    return UCC_DT_INT8;
-  case ncclUint8:
-    return UCC_DT_UINT8;
-  case ncclInt32:
-    return UCC_DT_INT32;
-  case ncclUint32:
-    return UCC_DT_UINT32;
-  case ncclInt64:
-    return UCC_DT_INT64;
-  case ncclUint64:
-    return UCC_DT_UINT64;
-  case ncclFloat16:
-    return UCC_DT_FLOAT16;
-  case ncclFloat32:
-    return UCC_DT_FLOAT32;
-  case ncclFloat64:
-    return UCC_DT_FLOAT64;
-  default:
-    return -1;
-  }
-}
-
 static __inline__ int typeSize(ncclDataType_t type) {
   switch (type) {
-    case ncclFloat16: return 2;
-    case ncclInt32: return 4;
-    case ncclUint32: return 4;
-    case ncclFloat32: return 4;
-    case ncclInt64: return 8;
-    case ncclUint64: return 8;
-    case ncclFloat64: return 8;
+    case ncclFloat16:  return 2;
+    case ncclInt32:    return 4;
+    case ncclUint32:   return 4;
+    case ncclFloat32:  return 4;
+    case ncclInt64:    return 8;
+    case ncclUint64:   return 8;
+    case ncclFloat64:  return 8;
     case ncclBfloat16: return 2;
-    case ncclInt8: return 1;
-    case ncclUint8: return 1;
+    case ncclInt8:     return 1;
+    case ncclUint8:    return 1;
     default:
       WARN("UCC: unsupported data type\n");
       return -1;
-  }
-}
-
-static __inline__ ucc_reduction_op_t opConvert(ncclRedOp_t op) {
-  switch (op) {
-    case ncclSum:  return UCC_OP_SUM;
-    case ncclProd: return UCC_OP_PROD;
-    case ncclMax:  return UCC_OP_MAX;
-    case ncclMin:  return UCC_OP_MIN;
-    case ncclAvg:  return UCC_OP_AVG;
-    default:       return -1;
   }
 }
 
@@ -222,10 +179,6 @@ static ucc_status_t ncclUccCtxCreate(struct ncclUCCCollComm *cComm, void *buf, s
   ucc_status_t         ucc_status;
   ucc_context_params_t ctx_params;
   ucc_context_config_h ctx_config;
-  ucc_mem_map_t        map;
-
-  map.address = buf;
-  map.len = len;
 
   ctx_params.mask = UCC_CONTEXT_PARAM_FIELD_OOB;
   ctx_params.oob.allgather = UCC_oob_allgather;
@@ -234,8 +187,6 @@ static ucc_status_t ncclUccCtxCreate(struct ncclUCCCollComm *cComm, void *buf, s
   ctx_params.oob.coll_info = (void *)cComm;
   ctx_params.oob.n_oob_eps = cComm->nranks;
   ctx_params.oob.oob_ep = cComm->rank;
-  ctx_params.mem_params.segments = &map;
-  ctx_params.mem_params.n_segments = 1;
 
   if (UCC_OK != (ucc_status = ucc_context_config_read(cComm->ucc_lib, NULL, &ctx_config))) {
     UCC_ERROR("UCC context config read failed\n");
@@ -287,8 +238,6 @@ static ucc_status_t ncclUccTeamCreate(struct ncclUCCCollComm *cComm, size_t rank
 }
     
 ncclResult_t ncclUCCInit(ncclDebugLogger_t logFunction) {
-  num_outstanding = 0;
-
   return ncclNetPlugin_v7.init(logFunction);
 }
 
@@ -325,64 +274,61 @@ ncclResult_t ncclUCCListen(int dev, void* opaqueHandle, void** listenComm) {
   return status;
 }
 
-ncclResult_t ncclUCCConnect(void* handles[], int nranks, int rank, void* listenComm, void** collComm)
-{
+ncclResult_t ncclUCCConnect(void* handles[], int nranks, int rank, void* listenComm, void** collComm) {
   struct ncclUCCListenComm *lComm = (struct ncclUCCListenComm *)listenComm;
   struct ncclUCCCollComm *cComm;
+  char *useUCC;
 
   /* let's create endpoints here */
-  char *useUCC;
-  useUCC = getenv("NCCL_UCC_ENABLE");
+  useUCC = getenv("NCCL_UCC_DISABLE");
   if (useUCC != NULL) {
-    ucc_status_t status;
-    size_t buffer_len;
-    int next;
+    INFO(NCCL_INIT|NCCL_NET|NCCL_ENV, "UCC: Set to disable on this communicator");
+    return ncclInvalidUsage;
+  }
+  ucc_status_t status;
+  int next;
 
-    NCCLCHECK(ncclIbMalloc((void *)&cComm, sizeof(struct ncclUCCCollComm)));
+  NCCLCHECK(ncclIbMalloc((void *)&cComm, sizeof(struct ncclUCCCollComm)));
 
-    cComm->nranks = nranks;
-    cComm->rank = rank;
-    /* create a staging buffer. F: should we remove? */
-    staging_buffer = malloc(STAGING_BUF_LEN);
-    buffer_len = STAGING_BUF_LEN;
+  cComm->nranks = nranks;
+  cComm->rank = rank;
 
-    next = (cComm->rank + 1) % nranks;
-    do {
-      if (cComm->sendComm == NULL) {
-        NCCLCHECK(ncclNetPlugin_v6.connect(lComm->dev, handles[next], &cComm->sendComm));
-      }
-      if (cComm->recvComm == NULL) {
-        NCCLCHECK(ncclNetPlugin_v6.accept(lComm->listenCommP2P, &cComm->recvComm));
-      }
-    } while (cComm->sendComm == NULL || cComm->recvComm == NULL);
-
-    ucc_lib_config_h lib_config;
-    ucc_lib_params_t lib_params;
-
-    lib_params.mask = UCC_LIB_PARAM_FIELD_THREAD_MODE;
-    lib_params.thread_mode = UCC_THREAD_MULTIPLE;
-
-    if (UCC_OK != ucc_lib_config_read("NCCL", NULL, &lib_config)) {
-      UCC_ERROR("UCC lib config read failed");
-      return -1;
+  next = (cComm->rank + 1) % nranks;
+  do {
+    if (cComm->sendComm == NULL) {
+      NCCLCHECK(ncclNetPlugin_v6.connect(lComm->dev, handles[next], &cComm->sendComm));
     }
-    if (UCC_OK != ucc_init(&lib_params, lib_config, &cComm->ucc_lib)) {
-      UCC_ERROR("UCC lib init failed");
-      ucc_lib_config_release(lib_config);
-      return -2;
+    if (cComm->recvComm == NULL) {
+      NCCLCHECK(ncclNetPlugin_v6.accept(lComm->listenCommP2P, &cComm->recvComm));
     }
+  } while (cComm->sendComm == NULL || cComm->recvComm == NULL);
+
+  ucc_lib_config_h lib_config;
+  ucc_lib_params_t lib_params;
+
+  lib_params.mask = UCC_LIB_PARAM_FIELD_THREAD_MODE;
+  lib_params.thread_mode = UCC_THREAD_MULTIPLE;
+
+  if (UCC_OK != ucc_lib_config_read("NCCL", NULL, &lib_config)) {
+    UCC_ERROR("UCC lib config read failed");
+    return -1;
+  }
+  if (UCC_OK != ucc_init(&lib_params, lib_config, &cComm->ucc_lib)) {
+    UCC_ERROR("UCC lib init failed");
     ucc_lib_config_release(lib_config);
+    return -2;
+  }
+  ucc_lib_config_release(lib_config);
 
-    status = ncclUccCtxCreate(cComm, staging_buffer, buffer_len);
-    if (status != UCC_OK) {
-      return !ncclSuccess;
-    }
+  status = ncclUccCtxCreate(cComm, NULL, 0);
+  if (status != UCC_OK) {
+    return !ncclSuccess;
+  }
 
-    status = ncclUccTeamCreate(cComm, rank, nranks);
-    if (status != UCC_OK) {
-      // ctx destroy
-      return !ncclSuccess;
-    }
+  status = ncclUccTeamCreate(cComm, rank, nranks);
+  if (status != UCC_OK) {
+    // ctx destroy
+    return !ncclSuccess;
   }
 
   INFO(NCCL_INIT, "UCC rank %d / %d initialized\n", rank, nranks);
@@ -391,11 +337,12 @@ ncclResult_t ncclUCCConnect(void* handles[], int nranks, int rank, void* listenC
 }
 
 ncclResult_t ncclUCCReduceSupport(ncclDataType_t dataType, ncclRedOp_t redOp, int* supported) {
-  *supported = ((typeConvert(dataType) != -1) && (ucc_opConvert(redOp) != -1));
+  *supported = 1;// ((ucc_typeConvert(dataType) != -1) && (ucc_opConvert(redOp) != -1));
   return ncclSuccess;
 }
 
-ncclResult_t ncclUCCRegMrDmaBuf(void* collComm, void* data, size_t size, int type, uint64_t offset, int fd, void** mhandle) {
+ncclResult_t ncclUCCRegMrDmaBuf(void* collComm, void* data, size_t size, int type, uint64_t offset, int fd, void** mhandle) 
+{
   return ncclSuccess;
 }
 
@@ -453,7 +400,6 @@ ncclResult_t ncclUCCIallreduce(void* collComm, void* sendData, void* recvData, i
   req->req_h = reqh;
   req->dst = recvData;
   req->len = typeSize(dataType) * count;
-  req->id = num_outstanding;
   *request = req;
   return ncclSuccess;
 }
@@ -492,7 +438,6 @@ ncclResult_t ncclUCCIallgather(void* collComm, void* sendData, int nRecvParts, n
   req->req_h = reqh;
   req->dst = recvParts[0].address;
   req->len = bytesPerRank;
-  req->id = num_outstanding;
   *request = req;
   return ncclSuccess;
 }
@@ -504,7 +449,7 @@ ncclResult_t ncclUCCIreducescatter(void* collComm, int nSendParts, ncclNetSGE_v8
 {
   struct ncclUCCCollComm* cComm = (struct ncclUCCCollComm*)collComm;
 
-  ucc_datatype_t ucc_type = typeConvert(dataType);
+  ucc_datatype_t ucc_type = ucc_typeConvert(dataType);
   if (ucc_type == -1) {
     WARN("UCC: unsupported data type\n");
     return ncclInternalError;
@@ -548,7 +493,6 @@ ncclResult_t ncclUCCIreducescatter(void* collComm, int nSendParts, ncclNetSGE_v8
   req->req_h = reqh;
   req->dst = recvData;
   req->len = dt_size;
-  req->id = num_outstanding;
 
   *request = req;
   return ncclSuccess;
