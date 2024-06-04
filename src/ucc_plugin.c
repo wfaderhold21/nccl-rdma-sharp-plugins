@@ -15,6 +15,7 @@ extern ncclNet_v7_t ncclNetPlugin_v7;
 extern ncclNet_v6_t ncclNetPlugin_v6;
 extern ncclNet_v5_t ncclNetPlugin_v5;
 int ncclNUCCDevs = -1;
+extern int ncclNSharpDevs;
 
 struct ncclUCCMemHandle{
   int  type;
@@ -31,10 +32,10 @@ struct ncclUCCListenComm {
 };
 
 typedef struct ncclUCCRequest {
-    uint64_t id;
-    void *dst;
-    size_t len;
-    void *req_h;
+    uint64_t used;
+    int size;
+    ucc_coll_req_h req_h;
+    ucc_context_h ctx;
 } request_t;
 
 struct ncclUCCCollComm {
@@ -242,7 +243,8 @@ ncclResult_t ncclUCCInit(ncclDebugLogger_t logFunction) {
 }
 
 ncclResult_t ncclUCCDevices(int* ndev) {
-  *ndev = 1;
+  /* FERROL: set to ncclNSharpDevs when ready to test with GPU Direct */
+  *ndev = 1; //ncclNSharpDevs;
   return ncclSuccess;
 }
 
@@ -337,7 +339,7 @@ ncclResult_t ncclUCCConnect(void* handles[], int nranks, int rank, void* listenC
 }
 
 ncclResult_t ncclUCCReduceSupport(ncclDataType_t dataType, ncclRedOp_t redOp, int* supported) {
-  *supported = 1;// ((ucc_typeConvert(dataType) != -1) && (ucc_opConvert(redOp) != -1));
+  *supported = ((ucc_typeConvert(dataType) != -1) && (ucc_opConvert(redOp) != -1));
   return ncclSuccess;
 }
 
@@ -364,7 +366,18 @@ ncclResult_t ncclUCCDeregMr(void* collComm, void* mhandle) {
 }
 
 ncclResult_t ncclUCCGetRequest(struct ncclUCCRequest* reqs, struct ncclUCCRequest** req) {
-  return ncclSuccess;
+  for (int i = 0; i < MAX_REQUESTS; i++) {
+    struct ncclUCCRequest *r = reqs + i;
+    if (r->used == 0) {
+        r->used = 1;
+        r->req_h = NULL;
+        r->ctx = NULL;
+        *req = r;
+        return ncclSuccess;
+    }
+  }
+  WARN("UCC: unable to allocate request");
+  return ncclInternalError;
 }
 
 ncclResult_t ncclUCCIallreduce(void* collComm, void* sendData, void* recvData, int count,
@@ -373,8 +386,7 @@ ncclResult_t ncclUCCIallreduce(void* collComm, void* sendData, void* recvData, i
 
   struct ncclUCCMemHandle *mr_src = (struct ncclUCCMemHandle *)sendMhandle;
   struct ncclUCCMemHandle *mr_dst = (struct ncclUCCMemHandle *)recvMhandle;
-  ucc_memory_type_t src_type = (mr_src->type == NCCL_PTR_CUDA) ? UCC_MEMORY_TYPE_CUDA : UCC_MEMORY_TYPE_HOST;
-  ucc_memory_type_t dst_type = (mr_dst->type == NCCL_PTR_CUDA) ? UCC_MEMORY_TYPE_CUDA : UCC_MEMORY_TYPE_HOST;
+
   ucc_coll_req_h reqh;
   ucc_coll_args_t coll_args = {
     .mask = 0,
@@ -383,23 +395,33 @@ ncclResult_t ncclUCCIallreduce(void* collComm, void* sendData, void* recvData, i
         .buffer = sendData,
         .count = count,
         .datatype = ucc_typeConvert(dataType),
-        .mem_type = src_type,
     },
     .dst.info = {
         .buffer = recvData,
         .count = count,
         .datatype = ucc_typeConvert(dataType),
-        .mem_type = dst_type,
     },
     .op = ucc_opConvert(redOp),
   };
+
+  if (mr_src != NULL) {
+    coll_args.src.info.mem_type = (mr_src->type == NCCL_PTR_CUDA) ? UCC_MEMORY_TYPE_CUDA : UCC_MEMORY_TYPE_HOST;
+  } else {
+    coll_args.src.info.mem_type = UCC_MEMORY_TYPE_UNKNOWN;
+  }
+
+  if (mr_dst != NULL) {
+    coll_args.dst.info.mem_type = (mr_dst->type == NCCL_PTR_CUDA) ? UCC_MEMORY_TYPE_CUDA : UCC_MEMORY_TYPE_HOST;
+  } else {
+    coll_args.dst.info.mem_type = UCC_MEMORY_TYPE_UNKNOWN;
+  }
+
   request_t *req = malloc(sizeof(request_t));
 
   ucc_collective_init(&coll_args, &reqh, cComm->ucc_team);
   ucc_collective_post(reqh);
   req->req_h = reqh;
-  req->dst = recvData;
-  req->len = typeSize(dataType) * count;
+  req->ctx = cComm->ucc_ctx;
   *request = req;
   return ncclSuccess;
 }
@@ -436,8 +458,6 @@ ncclResult_t ncclUCCIallgather(void* collComm, void* sendData, int nRecvParts, n
     ucc_collective_post(reqh);
   }
   req->req_h = reqh;
-  req->dst = recvParts[0].address;
-  req->len = bytesPerRank;
   *request = req;
   return ncclSuccess;
 }
@@ -467,7 +487,6 @@ ncclResult_t ncclUCCIreducescatter(void* collComm, int nSendParts, ncclNetSGE_v8
   ucc_memory_type_t src_type = (mr_src->type == NCCL_PTR_CUDA) ? UCC_MEMORY_TYPE_CUDA : UCC_MEMORY_TYPE_HOST;
   ucc_memory_type_t dst_type = (mr_dst->type == NCCL_PTR_CUDA) ? UCC_MEMORY_TYPE_CUDA : UCC_MEMORY_TYPE_HOST;
 
-  int dt_size = typeSize(dataType);
   request_t *req = malloc(sizeof(request_t));
   ucc_coll_args_t coll_args = {
     .mask = 0,
@@ -491,8 +510,6 @@ ncclResult_t ncclUCCIreducescatter(void* collComm, int nSendParts, ncclNetSGE_v8
   ucc_collective_init(&coll_args, &reqh, cComm->ucc_team);
   ucc_collective_post(reqh);
   req->req_h = reqh;
-  req->dst = recvData;
-  req->len = dt_size;
 
   *request = req;
   return ncclSuccess;
@@ -510,6 +527,7 @@ ncclResult_t ncclUCCTest(void* request, int* done, int* size) {
   status = ucc_collective_test(reqh);
   if (status == UCC_INPROGRESS) {
     *done = 0;
+    ucc_context_progress(req->ctx);
     return ncclSuccess;
   } else if (status < 0) {
     UCC_ERROR("error in test");
@@ -517,6 +535,7 @@ ncclResult_t ncclUCCTest(void* request, int* done, int* size) {
   }
 
   *done = 1;
+  req->used = 0;
   ucc_collective_finalize(reqh);
   return ncclSuccess;
 }
