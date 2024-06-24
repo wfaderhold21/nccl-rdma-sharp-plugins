@@ -33,8 +33,9 @@ struct ncclUCCListenComm {
 
 typedef struct ncclUCCRequest {
     uint64_t used;
+    ucc_coll_type_t coll_type;
     int size;
-    ucc_coll_req_h req_h;
+    ucc_coll_req_h req_h[2];
     ucc_context_h ctx;
 } request_t;
 
@@ -101,10 +102,10 @@ int ncclUCCAllGather(void *context, void *src_buf, void *recv_buf, int len) {
 
   p2p_plugin = nccl_p2p_get_plugin_type();
   if (p2p_plugin != NCCL_P2P_UCX) {
-    NCCLCHECK(ncclNetPlugin_v7.regMr(cComm->recvComm, recv_buf,
+    NCCLCHECK(ncclNetPlugin_v8.regMr(cComm->recvComm, recv_buf,
                                        cComm->nranks * len, NCCL_PTR_HOST,
                                        &rMhandle));
-    NCCLCHECK(ncclNetPlugin_v7.regMr(cComm->sendComm, recv_buf,
+    NCCLCHECK(ncclNetPlugin_v8.regMr(cComm->sendComm, recv_buf,
                                        cComm->nranks * len, NCCL_PTR_HOST,
                                        &sMhandle));
   }
@@ -118,29 +119,29 @@ int ncclUCCAllGather(void *context, void *src_buf, void *recv_buf, int len) {
       void *rbuf = ((char *)recv_buf) + rpeer * len;
       int tag = 0x69;
       if (srequest == NULL)
-        NCCLCHECK(ncclNetPlugin_v7.isend(cComm->sendComm,
+        NCCLCHECK(ncclNetPlugin_v8.isend(cComm->sendComm,
                                            ((char *)recv_buf) + speer * len,
                                            len, tag, sMhandle, &srequest));
       if (rrequest == NULL)
-        NCCLCHECK(ncclNetPlugin_v7.irecv(cComm->recvComm, 1, &rbuf, &len,
+        NCCLCHECK(ncclNetPlugin_v8.irecv(cComm->recvComm, 1, &rbuf, &len,
                                            &tag, &rMhandle, &rrequest));
     }
     while (srequest || rrequest) {
       int done;
       if (rrequest)
-        NCCLCHECK(ncclNetPlugin_v7.test(rrequest, &done, NULL));
+        NCCLCHECK(ncclNetPlugin_v8.test(rrequest, &done, NULL));
       if (done)
         rrequest = NULL;
       if (srequest)
-        NCCLCHECK(ncclNetPlugin_v7.test(srequest, &done, NULL));
+        NCCLCHECK(ncclNetPlugin_v8.test(srequest, &done, NULL));
       if (done)
         srequest = NULL;
     }
     speer = rpeer;
   }
   if (p2p_plugin != NCCL_P2P_UCX) {
-    NCCLCHECK(ncclNetPlugin_v7.deregMr(cComm->recvComm, rMhandle));
-    NCCLCHECK(ncclNetPlugin_v7.deregMr(cComm->sendComm, sMhandle));
+    NCCLCHECK(ncclNetPlugin_v8.deregMr(cComm->recvComm, rMhandle));
+    NCCLCHECK(ncclNetPlugin_v8.deregMr(cComm->sendComm, sMhandle));
   }
 
   return 0;
@@ -239,7 +240,7 @@ static ucc_status_t ncclUccTeamCreate(struct ncclUCCCollComm *cComm, size_t rank
 }
     
 ncclResult_t ncclUCCInit(ncclDebugLogger_t logFunction) {
-  return ncclNetPlugin_v7.init(logFunction);
+  return ncclNetPlugin_v8.init(logFunction);
 }
 
 ncclResult_t ncclUCCDevices(int* ndev) {
@@ -270,7 +271,7 @@ ncclResult_t ncclUCCListen(int dev, void* opaqueHandle, void** listenComm) {
   ncclResult_t status;
 
   NCCLCHECK(ncclIbMalloc((void**)&lComm, sizeof(struct ncclUCCListenComm)));
-  status = ncclNetPlugin_v7.listen(dev, opaqueHandle, &lComm->listenCommP2P);
+  status = ncclNetPlugin_v8.listen(dev, opaqueHandle, &lComm->listenCommP2P);
   lComm->dev = dev;
   *listenComm = lComm;
   return status;
@@ -356,7 +357,7 @@ ncclResult_t ncclUCCRegMr(void* collComm, void* data, size_t size, int type, voi
   return ncclSuccess;
 }
 
-ncclResult_t ncclUCCRegMr_v7(void* collComm, void* data, int size, int type, void** mhandle) {
+ncclResult_t ncclUCCRegMr_v8(void* collComm, void* data, int size, int type, void** mhandle) {
   return ncclUCCRegMr(collComm, data, size, type, mhandle);
 }
 
@@ -370,7 +371,7 @@ ncclResult_t ncclUCCGetRequest(struct ncclUCCRequest* reqs, struct ncclUCCReques
     struct ncclUCCRequest *r = reqs + i;
     if (r->used == 0) {
         r->used = 1;
-        r->req_h = NULL;
+//        r->req_h = NULL;
         r->ctx = NULL;
         *req = r;
         return ncclSuccess;
@@ -420,7 +421,7 @@ ncclResult_t ncclUCCIallreduce(void* collComm, void* sendData, void* recvData, i
 
   ucc_collective_init(&coll_args, &reqh, cComm->ucc_team);
   ucc_collective_post(reqh);
-  req->req_h = reqh;
+  req->req_h[0] = reqh;
   req->ctx = cComm->ucc_ctx;
   *request = req;
   return ncclSuccess;
@@ -436,28 +437,63 @@ ncclResult_t ncclUCCIallgather(void* collComm, void* sendData, int nRecvParts, n
   ucc_memory_type_t src_type = (mr_src->type == NCCL_PTR_CUDA) ? UCC_MEMORY_TYPE_CUDA : UCC_MEMORY_TYPE_HOST;
   ucc_memory_type_t dst_type = (mr_dst->type == NCCL_PTR_CUDA) ? UCC_MEMORY_TYPE_CUDA : UCC_MEMORY_TYPE_HOST;
   request_t *req = malloc(sizeof(request_t));
+  ucc_status_t status;
+#if 1
   ucc_coll_req_h reqh;
-  if (bytesPerRank == recvParts[0].size) {
-    ucc_coll_args_t coll_args = {
-        .mask = 0,
-        .coll_type = UCC_COLL_TYPE_ALLGATHER,
-        .src.info = {
-            .buffer = sendData,
-            .count = bytesPerRank,
-            .datatype = UCC_DT_INT8,
-            .mem_type = src_type,
-        },
-        .dst.info = {
-            .buffer = recvParts[0].address,
-            .count = recvParts[0].size,
-            .datatype = UCC_DT_INT8,
-            .mem_type = dst_type,
-        },
-    };
-    ucc_collective_init(&coll_args, &reqh, cComm->ucc_team);
-    ucc_collective_post(reqh);
+  ucc_coll_args_t coll_args = {
+      .mask = 0,
+      .coll_type = UCC_COLL_TYPE_ALLGATHER,
+      .src.info = {
+          .buffer = sendData,
+          .count = windowBytes / cComm->nranks,
+          .datatype = UCC_DT_INT8,
+          .mem_type = src_type,
+      },
+      .dst.info = {
+          .buffer = recvParts[0].address,
+          .count = recvParts[0].size,
+          .datatype = UCC_DT_INT8,
+          .mem_type = dst_type,
+      },
+  };
+  if (sendData == recvParts[0].address) {
+    coll_args.mask = UCC_COLL_ARGS_FIELD_FLAGS;
+    coll_args.flags = UCC_COLL_ARGS_FLAG_IN_PLACE;
   }
-  req->req_h = reqh;
+  status = ucc_collective_init(&coll_args, &reqh, cComm->ucc_team);
+  if (status != UCC_OK) {
+    UCC_ERROR("failed on coll init\n");
+    return ncclInternalError;
+  }
+  ucc_collective_post(reqh);
+  req->req_h[0] = reqh;
+  req->ctx = cComm->ucc_ctx;
+#else
+  memcpy(recvParts[0].address, sendData, windowBytes);
+  for (int i = 0; i < cComm->nranks; i++) {
+      ucc_coll_req_h reqh;
+      ucc_coll_args_t coll_args = {
+          .mask = 0,
+          .root = cComm->rank,
+          .coll_type = UCC_COLL_TYPE_BCAST,
+          .src.info = {
+              .buffer = recvParts[0].address,
+              .count = windowBytes,
+              .datatype = UCC_DT_INT8,
+              .mem_type = src_type,
+          },
+      };
+      status = ucc_collective_init(&coll_args, &reqh, cComm->ucc_team);
+      if (status != UCC_OK) {
+        UCC_ERROR("failed on coll init\n");
+        return ncclInternalError;
+      }
+      ucc_collective_post(reqh);
+      req->req_h[i] = reqh;
+  }
+  req->coll_type = UCC_COLL_TYPE_ALLGATHER;
+  req->ctx = cComm->ucc_ctx;
+#endif
   *request = req;
   return ncclSuccess;
 }
@@ -509,7 +545,7 @@ ncclResult_t ncclUCCIreducescatter(void* collComm, int nSendParts, ncclNetSGE_v8
 
   ucc_collective_init(&coll_args, &reqh, cComm->ucc_team);
   ucc_collective_post(reqh);
-  req->req_h = reqh;
+  req->req_h[0] = reqh;
 
   *request = req;
   return ncclSuccess;
@@ -521,22 +557,41 @@ ncclResult_t ncclUCCIflush(void* collComm, void* data, int size, void* mhandle, 
 
 ncclResult_t ncclUCCTest(void* request, int* done, int* size) {
   request_t *req = (request_t *)request;
-  ucc_coll_req_h reqh = req->req_h;
+  ucc_coll_req_h reqh = req->req_h[0];
   ucc_status_t status;
+  int inprogress = 0;
 
-  status = ucc_collective_test(reqh);
-  if (status == UCC_INPROGRESS) {
-    *done = 0;
-    ucc_context_progress(req->ctx);
-    return ncclSuccess;
-  } else if (status < 0) {
-    UCC_ERROR("error in test");
-    return !ncclSuccess;
+  if (1 || req->coll_type != UCC_COLL_TYPE_ALLGATHER) {
+      status = ucc_collective_test(reqh);
+      if (status == UCC_INPROGRESS) {
+        *done = 0;
+        ucc_context_progress(req->ctx);
+        return ncclSuccess;
+      } else if (status < 0) {
+        UCC_ERROR("error in test");
+        return !ncclSuccess;
+      }
+  } else {
+    for (int i = 0; i < 2; i++) {
+      reqh = req->req_h[i];
+      status = ucc_collective_test(reqh);
+      if (status == UCC_INPROGRESS) {
+        *done = 0;
+        ucc_context_progress(req->ctx);
+        inprogress++;
+//        return ncclSuccess;
+      } else if (status < 0) {
+        UCC_ERROR("error in test");
+        return !ncclSuccess;
+      }
+    }
   }
 
-  *done = 1;
-  req->used = 0;
-  ucc_collective_finalize(reqh);
+  if (inprogress == 0) {
+      *done = 1;
+      req->used = 0;
+      ucc_collective_finalize(reqh);
+  }
   return ncclSuccess;
 }
 
@@ -546,8 +601,8 @@ ncclResult_t ncclUCCCloseColl(void* collComm) {
   ucc_team_destroy(cComm->ucc_team);
   ucc_context_destroy(cComm->ucc_ctx);
   ucc_finalize(cComm->ucc_lib);
-  ncclNetPlugin_v7.closeRecv(cComm->recvComm);
-  ncclNetPlugin_v7.closeSend(cComm->sendComm);
+  ncclNetPlugin_v8.closeRecv(cComm->recvComm);
+  ncclNetPlugin_v8.closeSend(cComm->sendComm);
   free(cComm);
   return ncclSuccess;
 }
@@ -556,7 +611,7 @@ ncclResult_t ncclUCCCloseListen(void* listenComm) {
   struct ncclUCCListenComm *lComm = (struct ncclUCCListenComm*)listenComm;
   ncclResult_t status;
 
-  status = ncclNetPlugin_v7.closeListen(lComm->listenCommP2P);
+  status = ncclNetPlugin_v8.closeListen(lComm->listenCommP2P);
   free(listenComm);
   return status;
 }
@@ -589,7 +644,7 @@ ncclCollNet_v7_t ncclCollNetPlugin_v7 = {
   ncclUCCListen,
   ncclUCCConnect,
   ncclUCCReduceSupport,
-  ncclUCCRegMr_v7,
+  ncclUCCRegMr_v8,
   ncclUCCRegMrDmaBuf,
   ncclUCCDeregMr,
   ncclUCCIallreduce,
@@ -607,7 +662,7 @@ ncclCollNet_v6_t ncclCollNetPlugin_v6 = {
   ncclUCCListen,
   ncclUCCConnect,
   ncclUCCReduceSupport,
-  ncclUCCRegMr_v7,
+  ncclUCCRegMr_v8,
   ncclUCCRegMrDmaBuf,
   ncclUCCDeregMr,
   ncclUCCIallreduce,
@@ -625,7 +680,7 @@ ncclCollNet_v5_t ncclCollNetPlugin_v5 = {
   ncclUCCListen,
   ncclUCCConnect,
   ncclUCCReduceSupport,
-  ncclUCCRegMr_v7,
+  ncclUCCRegMr_v8,
   ncclUCCDeregMr,
   ncclUCCIallreduce,
   ncclUCCIflush,
