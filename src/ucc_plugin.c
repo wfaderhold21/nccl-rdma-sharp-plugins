@@ -438,13 +438,14 @@ ncclResult_t ncclUCCIallgather(void* collComm, void* sendData, int nRecvParts, n
   ucc_memory_type_t dst_type = (mr_dst->type == NCCL_PTR_CUDA) ? UCC_MEMORY_TYPE_CUDA : UCC_MEMORY_TYPE_HOST;
   request_t *req = malloc(sizeof(request_t));
   ucc_status_t status;
-#if 1
+  //printf("[%d] bytesPerRank %lu, windowOffset %lu, windowBytes %lu, recvParts size: %u, nRecvParts %d, sendData %p recv address: %p\n", cComm->rank, bytesPerRank, windowOffset, windowBytes, recvParts[0].size, nRecvParts, sendData, recvParts[0].address);
+#if 0
   ucc_coll_req_h reqh;
   ucc_coll_args_t coll_args = {
       .mask = 0,
       .coll_type = UCC_COLL_TYPE_ALLGATHER,
       .src.info = {
-          .buffer = sendData,
+          .buffer = sendData, //+ (windowBytes / cComm->nranks) * cComm->rank,
           .count = windowBytes / cComm->nranks,
           .datatype = UCC_DT_INT8,
           .mem_type = src_type,
@@ -470,11 +471,11 @@ ncclResult_t ncclUCCIallgather(void* collComm, void* sendData, int nRecvParts, n
   req->ctx = cComm->ucc_ctx;
 #else
   memcpy(recvParts[0].address, sendData, windowBytes);
-  for (int i = 0; i < cComm->nranks; i++) {
+//  for (int i = 0; i < cComm->nranks; i++) {
       ucc_coll_req_h reqh;
       ucc_coll_args_t coll_args = {
           .mask = 0,
-          .root = cComm->rank,
+          .root = (windowOffset < (bytesPerRank)) ? 0 : 1,//cComm->rank,
           .coll_type = UCC_COLL_TYPE_BCAST,
           .src.info = {
               .buffer = recvParts[0].address,
@@ -489,8 +490,8 @@ ncclResult_t ncclUCCIallgather(void* collComm, void* sendData, int nRecvParts, n
         return ncclInternalError;
       }
       ucc_collective_post(reqh);
-      req->req_h[i] = reqh;
-  }
+      req->req_h[0] = reqh;
+//  }
   req->coll_type = UCC_COLL_TYPE_ALLGATHER;
   req->ctx = cComm->ucc_ctx;
 #endif
@@ -565,6 +566,7 @@ ncclResult_t ncclUCCTest(void* request, int* done, int* size) {
       status = ucc_collective_test(reqh);
       if (status == UCC_INPROGRESS) {
         *done = 0;
+      //  printf("in progress!\n");
         ucc_context_progress(req->ctx);
         return ncclSuccess;
       } else if (status < 0) {
@@ -574,7 +576,17 @@ ncclResult_t ncclUCCTest(void* request, int* done, int* size) {
   } else {
     for (int i = 0; i < 2; i++) {
       reqh = req->req_h[i];
-      status = ucc_collective_test(reqh);
+      if (reqh != NULL) {
+        while (UCC_INPROGRESS == (status = ucc_collective_test(reqh))) {
+            ucc_context_progress(req->ctx);
+        }
+        ucc_collective_finalize(reqh);
+      }
+    }
+    *done = 1;
+    req->used = 0;
+    return ncclSuccess;
+/*
       if (status == UCC_INPROGRESS) {
         *done = 0;
         ucc_context_progress(req->ctx);
@@ -584,12 +596,13 @@ ncclResult_t ncclUCCTest(void* request, int* done, int* size) {
         UCC_ERROR("error in test");
         return !ncclSuccess;
       }
-    }
+    }*/
   }
 
   if (inprogress == 0) {
       *done = 1;
       req->used = 0;
+    //  printf("done!\n");
       ucc_collective_finalize(reqh);
   }
   return ncclSuccess;
