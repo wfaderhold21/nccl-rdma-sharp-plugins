@@ -438,41 +438,39 @@ ncclResult_t ncclUCCIallgather(void* collComm, void* sendData, int nRecvParts, n
   ucc_memory_type_t dst_type = (mr_dst->type == NCCL_PTR_CUDA) ? UCC_MEMORY_TYPE_CUDA : UCC_MEMORY_TYPE_HOST;
   request_t *req = malloc(sizeof(request_t));
   ucc_status_t status;
-  //printf("[%d] bytesPerRank %lu, windowOffset %lu, windowBytes %lu, recvParts size: %u, nRecvParts %d, sendData %p recv address: %p\n", cComm->rank, bytesPerRank, windowOffset, windowBytes, recvParts[0].size, nRecvParts, sendData, recvParts[0].address);
-#if 1
   ucc_coll_req_h reqh;
-  ucc_coll_args_t coll_args = {
-      .mask = 0,
-      .coll_type = UCC_COLL_TYPE_ALLGATHER,
-      .src.info = {
-          .buffer = sendData, //+ (windowBytes / cComm->nranks) * cComm->rank,
-          .count = windowBytes / cComm->nranks,
-          .datatype = UCC_DT_INT8,
-          .mem_type = src_type,
-      },
-      .dst.info = {
-          .buffer = recvParts[0].address,
-          .count = recvParts[0].size,
-          .datatype = UCC_DT_INT8,
-          .mem_type = dst_type,
-      },
-  };
-  if (sendData == recvParts[0].address) {
-    coll_args.mask = UCC_COLL_ARGS_FIELD_FLAGS;
-    coll_args.flags = UCC_COLL_ARGS_FLAG_IN_PLACE;
-  }
-  status = ucc_collective_init(&coll_args, &reqh, cComm->ucc_team);
-  if (status != UCC_OK) {
-    UCC_ERROR("failed on coll init\n");
-    return ncclInternalError;
-  }
-  ucc_collective_post(reqh);
-  req->req_h[0] = reqh;
-  req->ctx = cComm->ucc_ctx;
-#else
-//  memcpy(recvParts[0].address, sendData, windowBytes);
-//  for (int i = 0; i < cComm->nranks; i++) {
-      ucc_coll_req_h reqh;
+  if (windowBytes == (bytesPerRank * cComm->nranks)) {
+     /* full allgather, use allgather */
+      ucc_coll_args_t coll_args = {
+          .mask = 0,
+          .coll_type = UCC_COLL_TYPE_ALLGATHER,
+          .src.info = {
+              .buffer = sendData,
+              .count = windowBytes / cComm->nranks,
+              .datatype = UCC_DT_INT8,
+              .mem_type = src_type,
+          },
+          .dst.info = {
+              .buffer = recvParts[0].address,
+              .count = recvParts[0].size,
+              .datatype = UCC_DT_INT8,
+              .mem_type = dst_type,
+          },
+      };
+      if (sendData == recvParts[0].address) {
+        coll_args.mask = UCC_COLL_ARGS_FIELD_FLAGS;
+        coll_args.flags = UCC_COLL_ARGS_FLAG_IN_PLACE;
+      }
+      status = ucc_collective_init(&coll_args, &reqh, cComm->ucc_team);
+      if (status != UCC_OK) {
+        UCC_ERROR("failed on coll init\n");
+        return ncclInternalError;
+      }
+  } else {
+      /* partial allgather, bcast */
+      if ((bytesPerRank / cComm->nranks) >= 16384) {
+        memcpy(recvParts[0].address, sendData, windowBytes);
+      }
       int root = (windowOffset < bytesPerRank) ? 0 : 1;
       ucc_coll_args_t coll_args = {
           .mask = 0,
@@ -490,12 +488,11 @@ ncclResult_t ncclUCCIallgather(void* collComm, void* sendData, int nRecvParts, n
         UCC_ERROR("failed on coll init\n");
         return ncclInternalError;
       }
-      ucc_collective_post(reqh);
-      req->req_h[0] = reqh;
-//  }
-  req->coll_type = UCC_COLL_TYPE_ALLGATHER;
+  }
+  ucc_collective_post(reqh);
+  req->req_h[0] = reqh;
   req->ctx = cComm->ucc_ctx;
-#endif
+  req->coll_type = UCC_COLL_TYPE_ALLGATHER;
   *request = req;
   return ncclSuccess;
 }
