@@ -468,13 +468,15 @@ ncclResult_t ncclUCCIallgather(void* collComm, void* sendData, int nRecvParts, n
       }
   } else {
       /* partial allgather, bcast */
-      if ((bytesPerRank / cComm->nranks) >= 16384) {
+      int root = (windowOffset / (bytesPerRank));
+      if ((bytesPerRank / cComm->nranks) >= 16384 && root == cComm->rank) {
+        /* ucc does not copy this as root is the sender */
         memcpy(recvParts[0].address, sendData, windowBytes);
       }
-      int root = (windowOffset < bytesPerRank) ? 0 : 1;
+
       ucc_coll_args_t coll_args = {
           .mask = 0,
-          .root = root,//cComm->rank,
+          .root = root,
           .coll_type = UCC_COLL_TYPE_BCAST,
           .src.info = {
               .buffer = (root == cComm->rank) ? sendData : recvParts[0].address,
