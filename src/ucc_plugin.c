@@ -346,6 +346,10 @@ ncclResult_t ncclUCCReduceSupport(ncclDataType_t dataType, ncclRedOp_t redOp, in
 
 ncclResult_t ncclUCCRegMrDmaBuf(void* collComm, void* data, size_t size, int type, uint64_t offset, int fd, void** mhandle) 
 {
+  struct ncclUCCMemHandle *mh;
+  NCCLCHECK(ncclIbMalloc((void **)&mh, sizeof(struct ncclUCCMemHandle)));
+  mh->type = type;
+  *mhandle = mh;
   return ncclSuccess;
 }
 
@@ -523,6 +527,7 @@ ncclResult_t ncclUCCIreducescatter(void* collComm, int nSendParts, ncclNetSGE_v8
   struct ncclUCCMemHandle *mr_dst = (struct ncclUCCMemHandle *)recvMhandle;
   ucc_memory_type_t src_type = (mr_src->type == NCCL_PTR_CUDA) ? UCC_MEMORY_TYPE_CUDA : UCC_MEMORY_TYPE_HOST;
   ucc_memory_type_t dst_type = (mr_dst->type == NCCL_PTR_CUDA) ? UCC_MEMORY_TYPE_CUDA : UCC_MEMORY_TYPE_HOST;
+  ucc_coll_req_h reqh;
 
   request_t *req = malloc(sizeof(request_t));
   ucc_coll_args_t coll_args = {
@@ -530,27 +535,27 @@ ncclResult_t ncclUCCIreducescatter(void* collComm, int nSendParts, ncclNetSGE_v8
     .coll_type = UCC_COLL_TYPE_REDUCE_SCATTER,
     .src.info = {
         .buffer = sendParts[0].address,
-        .count = sendParts[0].size,
-        .datatype = ucc_typeConvert(dataType),
+        .count = sendParts[0].size / typeSize(dataType),
+        .datatype = ucc_type,
         .mem_type = src_type,
     },
     .dst.info = {
         .buffer = recvData,
-        .count = bytesPerRank,
-        .datatype = ucc_typeConvert(dataType),
+        .count = windowBytes / typeSize(dataType),
+        .datatype = ucc_type,
         .mem_type = dst_type,
     },
     .op = ucc_opConvert(redOp),
   };
-  ucc_coll_req_h reqh;
-
   ucc_collective_init(&coll_args, &reqh, cComm->ucc_team);
   ucc_collective_post(reqh);
   req->req_h[0] = reqh;
+  req->ctx = cComm->ucc_ctx;
+  req->coll_type = UCC_COLL_TYPE_REDUCE_SCATTER;
 
   *request = req;
   return ncclSuccess;
- }
+}
 
 ncclResult_t ncclUCCIflush(void* collComm, void* data, int size, void* mhandle, void **request) {
    return ncclSuccess;
