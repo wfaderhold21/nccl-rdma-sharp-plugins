@@ -541,11 +541,11 @@ ncclResult_t ncclUCCIreducescatter(void* collComm, int nSendParts, ncclNetSGE_v8
     },
     .dst.info = {
         .buffer = recvData,
-        .count = windowBytes / typeSize(dataType),
+        .count = (windowBytes / typeSize(dataType)) / cComm->nranks,
         .datatype = ucc_type,
         .mem_type = dst_type,
     },
-    .op = ucc_opConvert(redOp),
+    .op = op_type,
   };
   ucc_collective_init(&coll_args, &reqh, cComm->ucc_team);
   ucc_collective_post(reqh);
