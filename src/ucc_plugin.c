@@ -461,7 +461,7 @@ ncclResult_t ncclUCCIallgather(void* collComm, void* sendData, int nRecvParts, n
               .mem_type = dst_type,
           },
       };
-      if (sendData == recvParts[0].address) {
+      if ((uintptr_t)sendData == ((uintptr_t)recvParts[0].address + bytesPerRank * cComm->rank)) {
         coll_args.mask = UCC_COLL_ARGS_FIELD_FLAGS;
         coll_args.flags = UCC_COLL_ARGS_FLAG_IN_PLACE;
       }
